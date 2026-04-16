@@ -1,0 +1,7 @@
+pandas
+openpyxl
+python-dotenv
+requests
+streamlit
+plotly
+tomli; python_version < "3.11"

@@ -1,0 +1,10 @@
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+crm_brain.db
+*.log
+pipeline_watch*.log
+pipeline_watch*.err.log
+streamlit*.log
+streamlit*.err.log
