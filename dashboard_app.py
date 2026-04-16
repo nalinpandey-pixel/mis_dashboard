@@ -1,5 +1,6 @@
 import sqlite3
 import subprocess
+import sys
 from datetime import date, timedelta
 from typing import Dict, List, Tuple
 
@@ -266,7 +267,7 @@ def check_local_db_ready() -> bool:
 def run_pipeline_command(*extra_args: str) -> Tuple[bool, str]:
     try:
         result = subprocess.run(
-            ["python", "sales_pipeline.py", *extra_args],
+            [sys.executable, "sales_pipeline.py", *extra_args],
             cwd=str(DEFAULT_DB_FILE.parent),
             capture_output=True,
             text=True,
