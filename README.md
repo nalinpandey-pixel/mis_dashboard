@@ -70,3 +70,30 @@ SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
 - The app never writes back to Supabase.
 - For free hosting, the safest pattern is to use `Refresh till now` instead of depending on a permanent always-on 5-minute background worker.
 - The dashboard supports backdated analysis using the date filters.
+
+## Railway deployment notes
+
+If you deploy on Railway with persistent storage:
+
+1. Add a Volume and mount it to:
+
+```text
+/app/data
+```
+
+2. Add these variables in Railway:
+
+```env
+APP_DATA_DIR=/app/data
+CRM_BRAIN_DB_PATH=/app/data/crm_brain.db
+CRM_BRAIN_STATE_PATH=/app/data/state.json
+```
+
+3. Also add:
+
+```env
+SUPABASE_URL=your-supabase-url
+SUPABASE_KEY=your-key
+```
+
+The app will then keep `crm_brain.db` and `state.json` on the Railway volume instead of inside the temporary build filesystem.

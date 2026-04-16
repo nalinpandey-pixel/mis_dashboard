@@ -1,0 +1,7 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "streamlit run dashboard_app.py --server.address 0.0.0.0 --server.port $PORT"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

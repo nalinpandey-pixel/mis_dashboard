@@ -19,8 +19,9 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_FILE = BASE_DIR / "crm_brain.db"
-DEFAULT_STATE_FILE = BASE_DIR / "state.json"
+PERSISTENT_DATA_DIR = Path(os.getenv("APP_DATA_DIR", BASE_DIR))
+DEFAULT_DB_FILE = Path(os.getenv("CRM_BRAIN_DB_PATH", str(PERSISTENT_DATA_DIR / "crm_brain.db")))
+DEFAULT_STATE_FILE = Path(os.getenv("CRM_BRAIN_STATE_PATH", str(PERSISTENT_DATA_DIR / "state.json")))
 DEFAULT_START_SYNC_UTC = "2026-04-14T18:30:00+00:00"
 RAW_HISTORY_START_UTC = "2000-01-01T00:00:00+00:00"
 HISTORICAL_FILE = BASE_DIR / "oct_november.xlsx"
@@ -204,6 +205,7 @@ def write_state(state_path: Path, last_sync_utc: str) -> None:
         "last_sync": parsed.isoformat(),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -940,6 +942,7 @@ def persist_to_local_db(
     delete_window_utc: Optional[Tuple[str, str]] = None,
     historical_seed_df: Optional[pd.DataFrame] = None,
 ) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path))
     try:
         ensure_local_db(connection)
@@ -1017,6 +1020,8 @@ def load_rebuild_window_data(
 def run_sync(args: argparse.Namespace) -> int:
     state_path = Path(args.state_file).expanduser().resolve()
     db_path = Path(args.db_file).expanduser().resolve()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     config = load_supabase_config()
 
     if args.rebuild_yesterday:
