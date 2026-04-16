@@ -253,19 +253,36 @@ def load_product_penetration_data() -> pd.DataFrame:
 
 
 def check_local_db_ready() -> bool:
-    connection = sqlite3.connect(str(DEFAULT_DB_FILE))
     try:
-        exists = pd.read_sql_query(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'sales_raw'
-            """,
-            connection,
-        )
-    finally:
-        connection.close()
+        connection = sqlite3.connect(str(DEFAULT_DB_FILE))
+        try:
+            exists = pd.read_sql_query(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'sales_raw'
+                """,
+                connection,
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return False
     return not exists.empty
+
+
+def local_db_has_sales_rows() -> bool:
+    if not check_local_db_ready():
+        return False
+    try:
+        connection = sqlite3.connect(str(DEFAULT_DB_FILE))
+        try:
+            count_df = pd.read_sql_query("SELECT COUNT(*) AS row_count FROM sales_raw", connection)
+        finally:
+            connection.close()
+    except Exception:
+        return False
+    return bool(int(count_df["row_count"].iloc[0]) > 0)
 
 
 def run_pipeline_command(*extra_args: str) -> Tuple[bool, str]:
@@ -1432,7 +1449,8 @@ refresh_col, rebuild_col, status_col = st.columns([0.18, 0.22, 0.60])
 with refresh_col:
     if st.button("Refresh till now", use_container_width=True):
         with st.spinner("Refreshing latest data..."):
-            ok, message = run_pipeline_command()
+            refresh_args = ("--full-refresh",) if not local_db_has_sales_rows() else ()
+            ok, message = run_pipeline_command(*refresh_args)
         st.cache_data.clear()
         if ok:
             st.success("Dashboard updated till now.")
