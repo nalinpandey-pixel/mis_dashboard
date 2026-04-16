@@ -1,8 +1,0 @@
-[phases.setup]
-providers = ["python"]
-
-[phases.install]
-cmds = ["python -m pip install -r requirements.txt"]
-
-[start]
-cmd = "streamlit run dashboard_app.py --server.address 0.0.0.0 --server.port $PORT"
