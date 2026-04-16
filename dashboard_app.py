@@ -1,6 +1,7 @@
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 from datetime import date, timedelta
 from typing import Dict, List, Tuple
 
@@ -9,6 +10,9 @@ import plotly.express as px
 import streamlit as st
 
 from sales_pipeline import DEFAULT_DB_FILE, WALKIN_PLACEHOLDER, parse_utc_timestamp
+
+
+APP_DIR = Path(__file__).resolve().parent
 
 
 B2B_BRANCHES = {"b2b noida", "b2b gurgaon"}
@@ -267,8 +271,8 @@ def check_local_db_ready() -> bool:
 def run_pipeline_command(*extra_args: str) -> Tuple[bool, str]:
     try:
         result = subprocess.run(
-            [sys.executable, "sales_pipeline.py", *extra_args],
-            cwd=str(DEFAULT_DB_FILE.parent),
+            [sys.executable, str(APP_DIR / "sales_pipeline.py"), *extra_args],
+            cwd=str(APP_DIR),
             capture_output=True,
             text=True,
             timeout=300,
