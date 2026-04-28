@@ -1120,7 +1120,7 @@ def style_product_comparison_table(frame: pd.DataFrame):
 
     return (
         frame.style.format(format_map)
-        .applymap(change_bg, subset=["Qty Change", "Revenue Change", "Order Penetration Change"])
+        .map(change_bg, subset=["Qty Change", "Revenue Change", "Order Penetration Change"])
     )
 
 
@@ -1156,7 +1156,7 @@ def style_category_comparison_table(frame: pd.DataFrame):
 
     return (
         frame.style.format(format_map)
-        .applymap(change_bg, subset=["Qty Change", "Revenue Change", "Customers Change", "Customer Penetration Change"])
+        .map(change_bg, subset=["Qty Change", "Revenue Change", "Customers Change", "Customer Penetration Change"])
     )
 
 
@@ -1249,7 +1249,7 @@ def style_revenue_comparison_table(frame: pd.DataFrame):
 
     return (
         frame.style.format({"Current": "{:,.2f}", "Previous": "{:,.2f}", "Change": "{:,.2f}", "Change %": "{:,.2f}%"})
-        .applymap(color_change, subset=["Change", "Change %"])
+        .map(color_change, subset=["Change", "Change %"])
     )
 
 
