@@ -266,9 +266,11 @@ def load_product_penetration_data(
             "qty,net_amount,mob_no"
         ),
         filters={
-            "sales_date": f"gte.{query_start}",
-            "and": f"(sales_date.lte.{query_end})",
-            "product_name": "not.is.null",
+            "and": (
+                f"(sales_date.gte.{query_start},"
+                f"sales_date.lte.{query_end},"
+                "product_name.not.is.null)"
+            ),
         },
     ).copy()
 
@@ -621,6 +623,8 @@ def build_customer_churn_profile(
         customer_summary = customer_summary.merge(category_pref, on="phone", how="left")
         customer_summary = customer_summary.merge(product_repeat, on="phone", how="left")
 
+    if "favorite_product_last_bought" not in customer_summary.columns:
+        customer_summary["favorite_product_last_bought"] = None
     customer_summary["favorite_product_last_bought"] = pd.to_datetime(
         customer_summary["favorite_product_last_bought"], errors="coerce"
     ).dt.strftime("%Y-%m-%d")
@@ -2178,7 +2182,8 @@ if all_sales_df.empty:
 
 default_end = all_sales_df["sales_day"].max().date()
 default_start = all_sales_df["sales_day"].min().date()
-today_value = default_end
+ist_today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+today_value = min(ist_today, default_end)
 
 if "filter_from" not in st.session_state:
     st.session_state.filter_from = default_start
