@@ -4,4 +4,5 @@ python-dotenv
 requests
 streamlit
 plotly
+matplotlib
 tomli; python_version < "3.11"
