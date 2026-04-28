@@ -3,7 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 from datetime import date, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
@@ -63,8 +63,13 @@ def ensure_sqlite_indexes() -> bool:
     return True
 
 
-@st.cache_data(ttl=1800)
-def load_supabase_table(table_name: str, select_columns: str = "*") -> pd.DataFrame:
+@st.cache_data(ttl=600, max_entries=3)
+def load_supabase_table(
+    table_name: str,
+    select_columns: str = "*",
+    filters: Optional[Dict[str, str]] = None,
+    order_column: str = "sales_date",
+) -> pd.DataFrame:
     config = load_target_supabase_config()
     headers = supabase_headers(config)
     session = requests.Session()
@@ -78,9 +83,10 @@ def load_supabase_table(table_name: str, select_columns: str = "*") -> pd.DataFr
             headers=headers,
             params={
                 "select": select_columns,
-                "order": "sales_date.asc",
+                "order": f"{order_column}.asc",
                 "limit": SUPABASE_FETCH_PAGE_SIZE,
                 "offset": offset,
+                **(filters or {}),
             },
             timeout=60,
         )
@@ -96,47 +102,7 @@ def load_supabase_table(table_name: str, select_columns: str = "*") -> pd.DataFr
     return pd.DataFrame(all_rows)
 
 
-@st.cache_data(ttl=1800)
-def load_joined_items_from_supabase() -> pd.DataFrame:
-    history = load_supabase_table(SUPABASE_HISTORY_TABLE)
-    if history.empty:
-        return history
-    sales_raw = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "sales_no,mob_no,sales_date,branch_code,order_type,net_amount")
-
-    history["sales_no"] = history["sales_no"].fillna("").astype(str).str.strip()
-    if sales_raw.empty:
-        history["cleaned_sales_no"] = history["sales_no"]
-        history["cleaned_mob_no"] = history["mob_no"]
-        history["cleaned_sales_date"] = history["sales_date"]
-        history["cleaned_branch_code"] = history.get("branch_name")
-        history["cleaned_order_type"] = history.get("order_type")
-        history["cleaned_net_amount"] = history.get("net_amount")
-        return history
-
-    sales_raw = sales_raw.copy()
-    sales_raw["sales_no"] = sales_raw["sales_no"].fillna("").astype(str).str.strip()
-    sales_raw["sales_date"] = sales_raw["sales_date"].fillna("").astype(str)
-    sales_raw = sales_raw.sort_values("sales_date").drop_duplicates("sales_no", keep="last")
-    sales_raw = sales_raw.rename(
-        columns={
-            "sales_no": "cleaned_sales_no",
-            "mob_no": "cleaned_mob_no",
-            "sales_date": "cleaned_sales_date",
-            "branch_code": "cleaned_branch_code",
-            "order_type": "cleaned_order_type",
-            "net_amount": "cleaned_net_amount",
-        }
-    )
-    merged = history.merge(
-        sales_raw,
-        left_on="sales_no",
-        right_on="cleaned_sales_no",
-        how="left",
-    )
-    return merged
-
-
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=600, max_entries=2)
 def load_sales_data() -> pd.DataFrame:
     ensure_sqlite_indexes()
     frame = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "sales_date,sales_no,mob_no,net_amount,branch_code,order_type")
@@ -286,22 +252,34 @@ def load_sales_data() -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=600, max_entries=3)
 def load_product_penetration_data(
     query_start: str,
     query_end: str,
     branch_filter: str,
     type_filter: str,
 ) -> pd.DataFrame:
-    frame = load_joined_items_from_supabase().copy()
+    frame = load_supabase_table(
+        SUPABASE_HISTORY_TABLE,
+        select_columns=(
+            "sales_no,sales_date,branch_name,order_type,product_name,category_name,"
+            "qty,net_amount,mob_no"
+        ),
+        filters={
+            "sales_date": f"gte.{query_start}",
+            "and": f"(sales_date.lte.{query_end})",
+            "product_name": "not.is.null",
+        },
+    ).copy()
 
     if frame.empty:
         return frame
 
-    query_start_ts = pd.Timestamp(query_start)
-    query_end_ts = pd.Timestamp(query_end)
-    raw_sales_date = pd.to_datetime(frame["sales_date"], errors="coerce")
-    frame = frame[(raw_sales_date >= query_start_ts) & (raw_sales_date <= query_end_ts)].copy()
+    frame["cleaned_sales_no"] = frame["sales_no"]
+    frame["cleaned_mob_no"] = frame["mob_no"]
+    frame["cleaned_sales_date"] = frame["sales_date"]
+    frame["cleaned_branch_code"] = frame["branch_name"]
+    frame["cleaned_order_type"] = frame["order_type"]
 
     frame["sales_date"] = frame["cleaned_sales_date"].fillna(frame["sales_date"])
     frame["sales_date"] = frame["sales_date"].apply(safe_parse_sales_date)
@@ -344,7 +322,7 @@ def load_product_penetration_data(
     return frame
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=600, max_entries=2)
 def load_penetration_customer_profile() -> pd.DataFrame:
     frame = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "sales_no,sales_date,mob_no")
 
@@ -373,12 +351,28 @@ def load_penetration_customer_profile() -> pd.DataFrame:
     return profile
 
 
-@st.cache_data(ttl=3600)
-def load_persona_item_data(branch_filter: str, type_filter: str) -> pd.DataFrame:
-    frame = load_joined_items_from_supabase().copy()
+@st.cache_data(ttl=600, max_entries=4)
+def load_persona_item_data(branch_filter: str, type_filter: str, phone_filter: str = "") -> pd.DataFrame:
+    filters: Dict[str, str] = {"product_name": "not.is.null"}
+    if phone_filter.strip():
+        filters["mob_no"] = f"eq.{phone_filter.strip()}"
+    frame = load_supabase_table(
+        SUPABASE_HISTORY_TABLE,
+        select_columns=(
+            "sales_no,sales_date,branch_name,order_type,product_name,category_name,"
+            "qty,net_amount,mob_no"
+        ),
+        filters=filters,
+    ).copy()
 
     if frame.empty:
         return frame
+
+    frame["cleaned_sales_no"] = frame["sales_no"]
+    frame["cleaned_mob_no"] = frame["mob_no"]
+    frame["cleaned_sales_date"] = frame["sales_date"]
+    frame["cleaned_branch_code"] = frame["branch_name"]
+    frame["cleaned_order_type"] = frame["order_type"]
 
     frame["sales_date"] = frame["cleaned_sales_date"].fillna(frame["sales_date"])
     frame["sales_date"] = frame["sales_date"].apply(safe_parse_sales_date)
@@ -2999,7 +2993,6 @@ if selected_page == "Monthly Wallet":
         st.dataframe(style_currency_matrix(monthly_wallet), use_container_width=True)
 
 if selected_page == "Persona":
-    persona_source = load_persona_item_data(selected_branch, selected_type)
 
     st.subheader("Persona")
     st.caption(
@@ -3007,26 +3000,27 @@ if selected_page == "Persona":
         "and personalized product follow-up suggestions."
     )
 
-    if persona_source.empty:
-        st.info("No item-level customer rows found for the selected branch/type filters.")
-    else:
-        input_col, number_col = st.columns([1.2, 0.6])
-        with input_col:
-            persona_phone = st.text_input("Phone Number", placeholder="Enter customer phone number")
-        with number_col:
-            recommendation_limit = st.number_input(
-                "Products to show",
-                min_value=1,
-                max_value=20,
-                value=5,
-                step=1,
-            )
+    input_col, number_col = st.columns([1.2, 0.6])
+    with input_col:
+        persona_phone = st.text_input("Phone Number", placeholder="Enter customer phone number")
+    with number_col:
+        recommendation_limit = st.number_input(
+            "Products to show",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+        )
 
-        normalized_phone = str(persona_phone).strip()
-        if not normalized_phone:
-            st.info("Enter a phone number to generate personalization.")
+    normalized_phone = str(persona_phone).strip()
+    if not normalized_phone:
+        st.info("Enter a phone number to generate personalization.")
+    else:
+        persona_source = load_persona_item_data(selected_branch, selected_type, normalized_phone)
+        if persona_source.empty:
+            st.warning("No customer history found for that phone number in the filtered data.")
         else:
-            customer_frame = persona_source[persona_source["mob_no"] == normalized_phone].copy()
+            customer_frame = persona_source.copy()
             if customer_frame.empty:
                 st.warning("No customer history found for that phone number in the filtered data.")
             else:
@@ -3126,7 +3120,16 @@ if selected_page == "Persona":
                         )
 
 if selected_page == "Churn Dashboard":
-    churn_item_source = load_persona_item_data(selected_branch, selected_type)
+    deep_churn_analysis = st.checkbox(
+        "Include product/category affinity in churn analysis (slower, high memory)",
+        value=False,
+        key="deep_churn_analysis",
+    )
+    churn_item_source = (
+        load_persona_item_data(selected_branch, selected_type)
+        if deep_churn_analysis
+        else pd.DataFrame()
+    )
     churn_limit_col, churn_rule_col = st.columns([0.7, 0.7])
     with churn_limit_col:
         churn_list_limit = st.number_input(
@@ -3159,6 +3162,11 @@ if selected_page == "Churn Dashboard":
         f"Customers with more than {int(churn_threshold_days)} days since last purchase are marked as churned. "
         "Status is evaluated as of the selected end date."
     )
+    if not deep_churn_analysis:
+        st.caption(
+            "Light mode is active: churn page uses sales summary only for faster performance. "
+            "Enable product/category affinity only when needed."
+        )
     render_churn_definitions(int(churn_threshold_days))
 
     if churn_profile.empty:
