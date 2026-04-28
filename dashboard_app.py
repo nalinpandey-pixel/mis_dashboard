@@ -2255,6 +2255,10 @@ if "filter_to" not in st.session_state:
     st.session_state.filter_to = default_end
 if "month_filter" not in st.session_state:
     st.session_state.month_filter = "custom"
+if "from_date_input" not in st.session_state:
+    st.session_state.from_date_input = st.session_state.filter_from
+if "to_date_input" not in st.session_state:
+    st.session_state.to_date_input = st.session_state.filter_to
 
 quick_cols = st.columns(6)
 for col, label in zip(
@@ -2268,6 +2272,8 @@ for col, label in zip(
             end_date = min(end_date, default_end)
             st.session_state.filter_from = start_date
             st.session_state.filter_to = end_date
+            st.session_state.from_date_input = start_date
+            st.session_state.to_date_input = end_date
             st.session_state.month_filter = "custom"
 
 recent_months = (
@@ -2293,18 +2299,20 @@ if selected_month_option != "custom":
     month_end = min((selected_month_row["sales_month"] + pd.offsets.MonthEnd(1)).date(), default_end)
     st.session_state.filter_from = month_start
     st.session_state.filter_to = month_end
+    st.session_state.from_date_input = month_start
+    st.session_state.to_date_input = month_end
 st.session_state.month_filter = selected_month_option
 
 start_date = filter_cols[1].date_input(
     "From",
-    value=st.session_state.filter_from,
+    value=st.session_state.from_date_input,
     min_value=default_start,
     max_value=default_end,
     key="from_date_input",
 )
 end_date = filter_cols[2].date_input(
     "To",
-    value=st.session_state.filter_to,
+    value=st.session_state.to_date_input,
     min_value=default_start,
     max_value=default_end,
     key="to_date_input",
