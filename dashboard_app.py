@@ -57,6 +57,16 @@ def safe_parse_sales_date(value: str) -> pd.Timestamp:
     return parse_utc_timestamp(value).tz_convert("Asia/Kolkata").tz_localize(None)
 
 
+def supabase_quote_literal(value: object) -> str:
+    text = "" if value is None else str(value).strip()
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def build_supabase_in_filter(values: List[str]) -> str:
+    return "(" + ",".join(supabase_quote_literal(value) for value in values) + ")"
+
+
 @st.cache_resource
 def ensure_sqlite_indexes() -> bool:
     # Kept for compatibility with existing call sites; dashboard now reads from Supabase.
@@ -68,7 +78,7 @@ def load_supabase_table(
     table_name: str,
     select_columns: str = "*",
     filters: Optional[Dict[str, str]] = None,
-    order_column: str = "sales_date",
+    order_column: Optional[str] = "sales_date",
 ) -> pd.DataFrame:
     config = load_target_supabase_config()
     headers = supabase_headers(config)
@@ -78,16 +88,19 @@ def load_supabase_table(
     offset = 0
     all_rows: List[Dict[str, object]] = []
     while True:
+        params = {
+            "select": select_columns,
+            "limit": SUPABASE_FETCH_PAGE_SIZE,
+            "offset": offset,
+            **(filters or {}),
+        }
+        if order_column:
+            params["order"] = f"{order_column}.asc"
+
         response = session.get(
             f"{config.url}/rest/v1/{table_name}",
             headers=headers,
-            params={
-                "select": select_columns,
-                "order": f"{order_column}.asc",
-                "limit": SUPABASE_FETCH_PAGE_SIZE,
-                "offset": offset,
-                **(filters or {}),
-            },
+            params=params,
             timeout=60,
         )
         response.raise_for_status()
@@ -259,20 +272,22 @@ def load_product_penetration_data(
     branch_filter: str,
     type_filter: str,
 ) -> pd.DataFrame:
+    filter_clauses = [
+        f"sales_date.gte.{query_start}",
+        f"sales_date.lte.{query_end}",
+        "product_name.not.is.null",
+    ]
+    if type_filter in {"walkin", "delivery"}:
+        filter_clauses.append(f"order_type.eq.{supabase_quote_literal(type_filter)}")
+
     frame = load_supabase_table(
         SUPABASE_HISTORY_TABLE,
         select_columns=(
             "sales_no,sales_date,branch_name,order_type,product_name,category_name,"
             "qty,net_amount,mob_no"
         ),
-        filters={
-            "and": (
-                f"(sales_date.gte.{query_start},"
-                f"sales_date.lte.{query_end},"
-                "product_name.not.is.null,"
-                "product_name.neq.)"
-            ),
-        },
+        filters={"and": f"({','.join(filter_clauses)})"},
+        order_column=None,
     ).copy()
 
     if frame.empty:
@@ -305,7 +320,14 @@ def load_product_penetration_data(
         type_value = "" if type_filter == "Unspecified" else type_filter
         frame = frame[frame["order_type"] == type_value.lower()].copy()
 
-    customer_profile = load_penetration_customer_profile()
+    profile_phones = sorted(
+        {
+            phone
+            for phone in frame["mob_no"].dropna().astype(str).str.strip().tolist()
+            if phone and phone != WALKIN_PLACEHOLDER and phone.lower() != "none"
+        }
+    )
+    customer_profile = load_penetration_customer_profile(tuple(profile_phones))
     if not customer_profile.empty:
         frame = frame.merge(customer_profile, on="mob_no", how="left")
         frame["is_new_customer"] = (
@@ -325,9 +347,33 @@ def load_product_penetration_data(
     return frame
 
 
-@st.cache_data(ttl=600, max_entries=2)
-def load_penetration_customer_profile() -> pd.DataFrame:
-    frame = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "sales_no,sales_date,mob_no")
+@st.cache_data(ttl=600, max_entries=8)
+def load_penetration_customer_profile(phone_numbers: Tuple[str, ...] = tuple()) -> pd.DataFrame:
+    cleaned_phone_numbers = [
+        phone.strip()
+        for phone in phone_numbers
+        if str(phone).strip() and str(phone).strip() != WALKIN_PLACEHOLDER and str(phone).strip().lower() != "none"
+    ]
+
+    if cleaned_phone_numbers:
+        frames: List[pd.DataFrame] = []
+        for start_idx in range(0, len(cleaned_phone_numbers), 200):
+            batch = cleaned_phone_numbers[start_idx : start_idx + 200]
+            batch_frame = load_supabase_table(
+                SUPABASE_SALES_RAW_TABLE,
+                "sales_no,sales_date,mob_no",
+                filters={"mob_no": f"in.{build_supabase_in_filter(batch)}"},
+                order_column=None,
+            )
+            if not batch_frame.empty:
+                frames.append(batch_frame)
+        frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        frame = load_supabase_table(
+            SUPABASE_SALES_RAW_TABLE,
+            "sales_no,sales_date,mob_no",
+            order_column=None,
+        )
 
     if frame.empty:
         return pd.DataFrame(columns=["mob_no", "first_order_day", "lifetime_order_count"])
@@ -366,6 +412,7 @@ def load_persona_item_data(branch_filter: str, type_filter: str, phone_filter: s
             "qty,net_amount,mob_no"
         ),
         filters=filters,
+        order_column=None,
     ).copy()
 
     if frame.empty:
@@ -626,6 +673,12 @@ def build_customer_churn_profile(
 
     if "favorite_product_last_bought" not in customer_summary.columns:
         customer_summary["favorite_product_last_bought"] = None
+    if "favorite_product" not in customer_summary.columns:
+        customer_summary["favorite_product"] = None
+    if "favorite_category" not in customer_summary.columns:
+        customer_summary["favorite_category"] = None
+    if "repeat_anchor_product" not in customer_summary.columns:
+        customer_summary["repeat_anchor_product"] = None
     customer_summary["favorite_product_last_bought"] = pd.to_datetime(
         customer_summary["favorite_product_last_bought"], errors="coerce"
     ).dt.strftime("%Y-%m-%d")
@@ -854,7 +907,12 @@ def local_db_has_sales_rows() -> bool:
     if not check_local_db_ready():
         return False
     try:
-        count_df = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "id")
+        count_df = load_supabase_table(
+            SUPABASE_SALES_RAW_TABLE,
+            "sales_no",
+            filters={"limit": "1"},
+            order_column=None,
+        )
     except Exception:
         return False
     return not count_df.empty
@@ -2206,6 +2264,8 @@ for col, label in zip(
     with col:
         if st.button(label, key="quick_" + label.replace(" ", "_"), width="stretch"):
             start_date, end_date = apply_quick_range(label, today_value)
+            start_date = max(start_date, default_start)
+            end_date = min(end_date, default_end)
             st.session_state.filter_from = start_date
             st.session_state.filter_to = end_date
             st.session_state.month_filter = "custom"
@@ -2217,7 +2277,7 @@ recent_months = (
     .head(12)
 )
 st.caption(
-    "Months: " + "  Â·  ".join(recent_months["year_month_label"].tolist())
+    "Months: " + "  ·  ".join(recent_months["year_month_label"].tolist())
 )
 
 filter_cols = st.columns([1.1, 1.2, 1.2, 1.3, 1.1])
@@ -2230,7 +2290,7 @@ selected_month_option = filter_cols[0].selectbox(
 if selected_month_option != "custom":
     selected_month_row = recent_months[recent_months["year_month_label"] == selected_month_option].iloc[0]
     month_start = selected_month_row["sales_month"].date()
-    month_end = (selected_month_row["sales_month"] + pd.offsets.MonthEnd(1)).date()
+    month_end = min((selected_month_row["sales_month"] + pd.offsets.MonthEnd(1)).date(), default_end)
     st.session_state.filter_from = month_start
     st.session_state.filter_to = month_end
 st.session_state.month_filter = selected_month_option
@@ -2611,8 +2671,8 @@ if selected_page == "Revenue vs Last Month":
         st.plotly_chart(customer_chart, width="stretch")
 
 if selected_page == "Product Penetration":
-    product_query_start = min(start_date, shift_date_one_month(start_date)).strftime("%Y-%m-%d 00:00:00")
-    product_query_end = max(end_date, shift_date_one_month(end_date)).strftime("%Y-%m-%d 23:59:59")
+    product_query_start = min(start_date, shift_date_one_month(start_date)).strftime("%Y-%m-%dT00:00:00")
+    product_query_end = max(end_date, shift_date_one_month(end_date)).strftime("%Y-%m-%dT23:59:59")
     product_df = load_product_penetration_data(
         product_query_start,
         product_query_end,
@@ -3337,9 +3397,14 @@ if selected_page == "Churn Dashboard":
             at_risk_count = int((churn_profile["status"] == "At Risk").sum())
             churned_count = int((churn_profile["status"] == "Churned").sum())
             avg_gap = float(churn_profile["avg_reorder_days"].dropna().mean()) if churn_profile["avg_reorder_days"].notna().any() else 0.0
+            favorite_category_series = (
+                churn_profile["favorite_category"].dropna()
+                if "favorite_category" in churn_profile.columns
+                else pd.Series(dtype="object")
+            )
             top_category = (
-                churn_profile["favorite_category"].dropna().mode().iat[0]
-                if churn_profile["favorite_category"].dropna().any()
+                favorite_category_series.mode().iat[0]
+                if not favorite_category_series.empty
                 else "core staples"
             )
             st.metric("Average Reorder Gap", f"{avg_gap:,.1f} days")
