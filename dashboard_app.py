@@ -269,7 +269,8 @@ def load_product_penetration_data(
             "and": (
                 f"(sales_date.gte.{query_start},"
                 f"sales_date.lte.{query_end},"
-                "product_name.not.is.null)"
+                "product_name.not.is.null,"
+                "product_name.neq.)"
             ),
         },
     ).copy()
@@ -749,6 +750,11 @@ def build_churn_reason_analysis(profile: pd.DataFrame) -> Tuple[pd.DataFrame, pd
             "no_orders_l90_pct": 0.0,
             "cycle_break_pct": 0.0,
         }
+
+    if "favorite_category" not in churned.columns:
+        churned["favorite_category"] = None
+    if "favorite_product" not in churned.columns:
+        churned["favorite_product"] = None
 
     churned["one_time_buyer"] = churned["total_orders"].le(1)
     churned["no_orders_l90"] = churned["orders_last_90"].eq(0)
