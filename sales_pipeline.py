@@ -1284,6 +1284,18 @@ def dedupe_sales_raw_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return deduped
 
 
+def dedupe_rows_by_key(rows: List[Dict[str, Any]], key_name: str) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen_keys = set()
+    for row in rows:
+        key = row.get(key_name)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(row)
+    return deduped
+
+
 def delete_remote_sales_raw_conflicts(
     config: SupabaseConfig,
     table_name: str,
@@ -1305,6 +1317,31 @@ def delete_remote_sales_raw_conflicts(
             config,
             table_name,
             {"sales_no": f"in.{build_supabase_in_filter(batch)}"},
+        )
+
+
+def delete_remote_rows_by_key(
+    config: SupabaseConfig,
+    table_name: str,
+    rows: List[Dict[str, Any]],
+    key_name: str,
+) -> None:
+    values = sorted(
+        {
+            str(row.get(key_name)).strip()
+            for row in rows
+            if row.get(key_name) is not None and str(row.get(key_name)).strip()
+        }
+    )
+    if not values:
+        return
+
+    for index in range(0, len(values), FETCH_PAGE_SIZE):
+        batch = values[index : index + FETCH_PAGE_SIZE]
+        delete_remote_rows(
+            config,
+            table_name,
+            {key_name: f"in.{build_supabase_in_filter(batch)}"},
         )
 
 
@@ -1721,13 +1758,18 @@ def persist_to_target_supabase(
 
     cleaned_payload = prepare_remote_cleaned_rows(cleaned_df)
     removed_payload = prepare_remote_removed_rows(removed_rows)
+    cleaned_payload = dedupe_rows_by_key(cleaned_payload, "record_id")
+    removed_payload = dedupe_rows_by_key(removed_payload, "removed_id")
     starting_id = 0 if full_refresh else fetch_remote_max_sales_raw_id(config, sales_raw_table)
     sales_raw_payload = dedupe_sales_raw_payload(prepare_remote_sales_raw_rows(cleaned_df, starting_id))
     raw_history_payload = prepare_remote_raw_history_rows(raw_df)
+    raw_history_payload = dedupe_rows_by_key(raw_history_payload, "_row_hash")
     historical_seed_payload = prepare_remote_historical_seed_rows(historical_seed_df) if historical_seed_df is not None else []
 
     post_remote_rows(config, cleaned_table, cleaned_payload, upsert=True, on_conflict="record_id")
-    post_remote_rows(config, removed_table, removed_payload, upsert=True, on_conflict="removed_id")
+    if removed_payload:
+        delete_remote_rows_by_key(config, removed_table, removed_payload, "removed_id")
+    post_remote_rows(config, removed_table, removed_payload, upsert=False)
     if full_refresh and historical_seed_payload:
         post_remote_rows(config, sales_raw_table, historical_seed_payload, upsert=False)
     elif sales_raw_payload:
