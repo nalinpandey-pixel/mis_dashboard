@@ -7,12 +7,22 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
-from sales_pipeline import DEFAULT_DB_FILE, WALKIN_PLACEHOLDER, parse_utc_timestamp
+from sales_pipeline import (
+    DEFAULT_DB_FILE,
+    WALKIN_PLACEHOLDER,
+    load_target_supabase_config,
+    parse_utc_timestamp,
+    supabase_headers,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
+SUPABASE_FETCH_PAGE_SIZE = 1000
+SUPABASE_SALES_RAW_TABLE = "sales_raw_backup"
+SUPABASE_HISTORY_TABLE = "sales_items_history_backup"
 
 
 B2B_BRANCHES = {"b2b noida", "b2b gurgaon"}
@@ -47,26 +57,98 @@ def safe_parse_sales_date(value: str) -> pd.Timestamp:
     return parse_utc_timestamp(value).tz_convert("Asia/Kolkata").tz_localize(None)
 
 
-@st.cache_data(ttl=30)
-def load_sales_data() -> pd.DataFrame:
-    connection = sqlite3.connect(str(DEFAULT_DB_FILE))
-    try:
-        frame = pd.read_sql_query(
-            """
-            SELECT
-                sales_date AS salesDate,
-                sales_no AS order_id,
-                mob_no AS phone,
-                net_amount AS amount,
-                branch_code,
-                order_type
-            FROM sales_raw
-            ORDER BY sales_date
-            """,
-            connection,
+@st.cache_resource
+def ensure_sqlite_indexes() -> bool:
+    # Kept for compatibility with existing call sites; dashboard now reads from Supabase.
+    return True
+
+
+@st.cache_data(ttl=1800)
+def load_supabase_table(table_name: str, select_columns: str = "*") -> pd.DataFrame:
+    config = load_target_supabase_config()
+    headers = supabase_headers(config)
+    session = requests.Session()
+    session.trust_env = False
+
+    offset = 0
+    all_rows: List[Dict[str, object]] = []
+    while True:
+        response = session.get(
+            f"{config.url}/rest/v1/{table_name}",
+            headers=headers,
+            params={
+                "select": select_columns,
+                "order": "sales_date.asc",
+                "limit": SUPABASE_FETCH_PAGE_SIZE,
+                "offset": offset,
+            },
+            timeout=60,
         )
-    finally:
-        connection.close()
+        response.raise_for_status()
+        rows = response.json() or []
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if len(rows) < SUPABASE_FETCH_PAGE_SIZE:
+            break
+        offset += SUPABASE_FETCH_PAGE_SIZE
+
+    return pd.DataFrame(all_rows)
+
+
+@st.cache_data(ttl=1800)
+def load_joined_items_from_supabase() -> pd.DataFrame:
+    history = load_supabase_table(SUPABASE_HISTORY_TABLE)
+    if history.empty:
+        return history
+    sales_raw = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "sales_no,mob_no,sales_date,branch_code,order_type,net_amount")
+
+    history["sales_no"] = history["sales_no"].fillna("").astype(str).str.strip()
+    if sales_raw.empty:
+        history["cleaned_sales_no"] = history["sales_no"]
+        history["cleaned_mob_no"] = history["mob_no"]
+        history["cleaned_sales_date"] = history["sales_date"]
+        history["cleaned_branch_code"] = history.get("branch_name")
+        history["cleaned_order_type"] = history.get("order_type")
+        history["cleaned_net_amount"] = history.get("net_amount")
+        return history
+
+    sales_raw = sales_raw.copy()
+    sales_raw["sales_no"] = sales_raw["sales_no"].fillna("").astype(str).str.strip()
+    sales_raw["sales_date"] = sales_raw["sales_date"].fillna("").astype(str)
+    sales_raw = sales_raw.sort_values("sales_date").drop_duplicates("sales_no", keep="last")
+    sales_raw = sales_raw.rename(
+        columns={
+            "sales_no": "cleaned_sales_no",
+            "mob_no": "cleaned_mob_no",
+            "sales_date": "cleaned_sales_date",
+            "branch_code": "cleaned_branch_code",
+            "order_type": "cleaned_order_type",
+            "net_amount": "cleaned_net_amount",
+        }
+    )
+    merged = history.merge(
+        sales_raw,
+        left_on="sales_no",
+        right_on="cleaned_sales_no",
+        how="left",
+    )
+    return merged
+
+
+@st.cache_data(ttl=3600)
+def load_sales_data() -> pd.DataFrame:
+    ensure_sqlite_indexes()
+    frame = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "sales_date,sales_no,mob_no,net_amount,branch_code,order_type")
+    if not frame.empty:
+        frame = frame.rename(
+            columns={
+                "sales_date": "salesDate",
+                "sales_no": "order_id",
+                "mob_no": "phone",
+                "net_amount": "amount",
+            }
+        )
 
     if frame.empty:
         return frame
@@ -204,36 +286,22 @@ def load_sales_data() -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(ttl=30)
-def load_product_penetration_data() -> pd.DataFrame:
-    connection = sqlite3.connect(str(DEFAULT_DB_FILE))
-    try:
-        frame = pd.read_sql_query(
-            """
-            SELECT
-                sales_no,
-                sales_date,
-                branch_name,
-                order_type,
-                product_name,
-                qty,
-                net_amount,
-                mob_no,
-                cleaned_sales_no,
-                cleaned_mob_no,
-                cleaned_sales_date,
-                cleaned_branch_code,
-                cleaned_order_type
-            FROM sales_items_joined
-            WHERE cleaned_sales_no IS NOT NULL
-            """,
-            connection,
-        )
-    finally:
-        connection.close()
+@st.cache_data(ttl=3600)
+def load_product_penetration_data(
+    query_start: str,
+    query_end: str,
+    branch_filter: str,
+    type_filter: str,
+) -> pd.DataFrame:
+    frame = load_joined_items_from_supabase().copy()
 
     if frame.empty:
         return frame
+
+    query_start_ts = pd.Timestamp(query_start)
+    query_end_ts = pd.Timestamp(query_end)
+    raw_sales_date = pd.to_datetime(frame["sales_date"], errors="coerce")
+    frame = frame[(raw_sales_date >= query_start_ts) & (raw_sales_date <= query_end_ts)].copy()
 
     frame["sales_date"] = frame["cleaned_sales_date"].fillna(frame["sales_date"])
     frame["sales_date"] = frame["sales_date"].apply(safe_parse_sales_date)
@@ -246,43 +314,546 @@ def load_product_penetration_data() -> pd.DataFrame:
     frame["branch_code"] = frame["cleaned_branch_code"].fillna(frame["branch_name"]).apply(normalize_branch)
     frame["order_type"] = frame["cleaned_order_type"].fillna(frame["order_type"]).apply(normalize_order_type)
     frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
+    frame["category_name"] = frame["category_name"].fillna("").astype(str).str.strip()
     frame = frame[frame["product_name"] != ""].copy()
     frame["qty"] = pd.to_numeric(frame["qty"], errors="coerce").fillna(0.0)
     frame["net_amount"] = pd.to_numeric(frame["net_amount"], errors="coerce").fillna(0.0)
+    if branch_filter != "All Branches":
+        frame = frame[frame["branch_code"] == branch_filter].copy()
+    if type_filter != "All Types":
+        type_value = "" if type_filter == "Unspecified" else type_filter
+        frame = frame[frame["order_type"] == type_value.lower()].copy()
+
+    customer_profile = load_penetration_customer_profile()
+    if not customer_profile.empty:
+        frame = frame.merge(customer_profile, on="mob_no", how="left")
+        frame["is_new_customer"] = (
+            frame["mob_no"].ne(WALKIN_PLACEHOLDER)
+            & frame["first_order_day"].notna()
+            & frame["sales_day"].eq(frame["first_order_day"])
+        )
+        frame["is_one_time_customer"] = (
+            frame["mob_no"].ne(WALKIN_PLACEHOLDER)
+            & frame["lifetime_order_count"].fillna(0).le(1)
+        )
+    else:
+        frame["first_order_day"] = pd.NaT
+        frame["lifetime_order_count"] = 0
+        frame["is_new_customer"] = False
+        frame["is_one_time_customer"] = False
     return frame
+
+
+@st.cache_data(ttl=3600)
+def load_penetration_customer_profile() -> pd.DataFrame:
+    frame = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "sales_no,sales_date,mob_no")
+
+    if frame.empty:
+        return pd.DataFrame(columns=["mob_no", "first_order_day", "lifetime_order_count"])
+
+    frame["sales_date"] = frame["sales_date"].apply(safe_parse_sales_date)
+    frame["sales_day"] = frame["sales_date"].dt.normalize()
+    frame["mob_no"] = frame["mob_no"].fillna("").astype(str).str.strip()
+    frame["mob_no"] = frame["mob_no"].replace({"": WALKIN_PLACEHOLDER, "None": WALKIN_PLACEHOLDER})
+    frame = frame[frame["mob_no"] != WALKIN_PLACEHOLDER].copy()
+    if frame.empty:
+        return pd.DataFrame(columns=["mob_no", "first_order_day", "lifetime_order_count"])
+
+    order_key = frame["sales_no"].fillna("").astype(str).str.strip()
+    order_key = order_key.where(order_key.ne(""), frame["mob_no"] + "|" + frame["sales_day"].astype(str))
+    frame["order_key"] = order_key
+
+    profile = (
+        frame.groupby("mob_no", as_index=False)
+        .agg(
+            first_order_day=("sales_day", "min"),
+            lifetime_order_count=("order_key", "nunique"),
+        )
+    )
+    return profile
+
+
+@st.cache_data(ttl=3600)
+def load_persona_item_data(branch_filter: str, type_filter: str) -> pd.DataFrame:
+    frame = load_joined_items_from_supabase().copy()
+
+    if frame.empty:
+        return frame
+
+    frame["sales_date"] = frame["cleaned_sales_date"].fillna(frame["sales_date"])
+    frame["sales_date"] = frame["sales_date"].apply(safe_parse_sales_date)
+    frame["sales_day"] = frame["sales_date"].dt.normalize()
+    frame["sales_no"] = frame["cleaned_sales_no"].fillna(frame["sales_no"]).fillna("").astype(str).str.strip()
+    frame["mob_no"] = frame["cleaned_mob_no"].fillna(frame["mob_no"]).fillna("").astype(str).str.strip()
+    frame["mob_no"] = frame["mob_no"].replace({"": WALKIN_PLACEHOLDER, "None": WALKIN_PLACEHOLDER})
+    frame["branch_code"] = frame["cleaned_branch_code"].fillna(frame["branch_name"]).apply(normalize_branch)
+    frame["order_type"] = frame["cleaned_order_type"].fillna(frame["order_type"]).apply(normalize_order_type)
+    frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
+    frame["category_name"] = frame["category_name"].fillna("").astype(str).str.strip()
+    frame["qty"] = pd.to_numeric(frame["qty"], errors="coerce").fillna(0.0)
+    frame["net_amount"] = pd.to_numeric(frame["net_amount"], errors="coerce").fillna(0.0)
+    frame = frame[(frame["product_name"] != "") & (frame["mob_no"] != WALKIN_PLACEHOLDER)].copy()
+    if branch_filter != "All Branches":
+        frame = frame[frame["branch_code"] == branch_filter].copy()
+    if type_filter != "All Types":
+        type_value = "" if type_filter == "Unspecified" else type_filter
+        frame = frame[frame["order_type"] == type_value.lower()].copy()
+    return frame
+
+
+def build_persona_product_mix(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+
+    summary = (
+        frame.groupby(["product_name", "category_name"], as_index=False)
+        .agg(
+            qty=("qty", "sum"),
+            revenue=("net_amount", "sum"),
+            orders=("sales_no", "nunique"),
+            last_bought=("sales_day", "max"),
+        )
+        .sort_values(["revenue", "qty"], ascending=[False, False])
+    )
+    total_revenue = float(summary["revenue"].sum())
+    summary["revenue_mix_pct"] = 0.0 if total_revenue == 0 else (summary["revenue"] / total_revenue) * 100
+    summary["last_bought"] = pd.to_datetime(summary["last_bought"]).dt.strftime("%Y-%m-%d")
+    return summary
+
+
+def build_persona_repeat_profile(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+
+    analysis_date = frame["sales_day"].max()
+    rows: List[Dict[str, object]] = []
+    for product_name, product_frame in frame.groupby("product_name"):
+        purchase_days = (
+            product_frame["sales_day"]
+            .drop_duplicates()
+            .sort_values()
+            .reset_index(drop=True)
+        )
+        if purchase_days.empty:
+            continue
+        gaps = purchase_days.diff().dropna().dt.days
+        avg_repeat_days = float(gaps.mean()) if not gaps.empty else None
+        last_bought = purchase_days.iloc[-1]
+        days_since_last = int((analysis_date - last_bought).days)
+        rows.append(
+            {
+                "product_name": product_name,
+                "purchase_days": int(len(purchase_days)),
+                "repeat_cycles": int(len(gaps)),
+                "avg_repeat_days": None if avg_repeat_days is None else round(avg_repeat_days, 1),
+                "last_bought": pd.to_datetime(last_bought).strftime("%Y-%m-%d"),
+                "days_since_last_purchase": days_since_last,
+                "reorder_signal": (
+                    "Needs attention"
+                    if avg_repeat_days is not None and days_since_last >= avg_repeat_days
+                    else "Watch"
+                ),
+            }
+        )
+
+    repeat_profile = pd.DataFrame(rows)
+    if repeat_profile.empty:
+        return repeat_profile
+    repeat_profile["avg_repeat_days_sort"] = repeat_profile["avg_repeat_days"].fillna(10**9)
+    repeat_profile = repeat_profile.sort_values(
+        ["reorder_signal", "avg_repeat_days_sort", "purchase_days", "product_name"],
+        ascending=[True, True, False, True],
+    ).drop(columns=["avg_repeat_days_sort"])
+    return repeat_profile
+
+
+def build_persona_recommendations(frame: pd.DataFrame, limit: int) -> pd.DataFrame:
+    repeat_profile = build_persona_repeat_profile(frame)
+    if repeat_profile.empty:
+        return repeat_profile
+    ranked = repeat_profile[repeat_profile["avg_repeat_days"].notna()].copy()
+    if ranked.empty:
+        return pd.DataFrame()
+    ranked["gap_vs_average"] = ranked["days_since_last_purchase"] - ranked["avg_repeat_days"]
+    ranked = ranked.sort_values(
+        ["gap_vs_average", "purchase_days"],
+        ascending=[False, False],
+    )
+    return ranked.head(limit)
+
+
+def build_customer_churn_profile(
+    sales_frame: pd.DataFrame,
+    item_frame: pd.DataFrame,
+    reference_date: date,
+    churn_days: int = 60,
+) -> pd.DataFrame:
+    base_sales = sales_frame[
+        (sales_frame["phone"] != WALKIN_PLACEHOLDER)
+        & (~sales_frame["is_b2b"])
+    ].copy()
+    if base_sales.empty:
+        return pd.DataFrame()
+
+    reference_day = pd.Timestamp(reference_date).normalize()
+    order_key = base_sales["order_id"].fillna("").astype(str).str.strip()
+    order_key = order_key.where(order_key.ne(""), base_sales["phone"] + "|" + base_sales["sales_day"].astype(str))
+    base_sales["order_key"] = order_key
+
+    base_sales = base_sales.sort_values(["phone", "sales_day", "order_key"])
+    order_summary = (
+        base_sales.groupby(["phone", "sales_day", "order_key"], as_index=False)
+        .agg(order_amount=("amount", "sum"))
+    )
+
+    customer_summary = (
+        order_summary.groupby("phone", as_index=False)
+        .agg(
+            first_purchase=("sales_day", "min"),
+            last_purchase=("sales_day", "max"),
+            total_orders=("order_key", "nunique"),
+            total_spend=("order_amount", "sum"),
+        )
+    )
+    customer_summary["avg_order_value"] = (
+        customer_summary["total_spend"] / customer_summary["total_orders"].replace(0, pd.NA)
+    ).fillna(0.0)
+    customer_summary["days_since_last_purchase"] = (
+        reference_day - customer_summary["last_purchase"]
+    ).dt.days.astype(int)
+
+    orders_last_30 = (
+        order_summary[order_summary["sales_day"] >= (reference_day - pd.Timedelta(days=30))]
+        .groupby("phone")["order_key"].nunique()
+        .rename("orders_last_30")
+    )
+    orders_last_60 = (
+        order_summary[order_summary["sales_day"] >= (reference_day - pd.Timedelta(days=60))]
+        .groupby("phone")["order_key"].nunique()
+        .rename("orders_last_60")
+    )
+    orders_last_90 = (
+        order_summary[order_summary["sales_day"] >= (reference_day - pd.Timedelta(days=90))]
+        .groupby("phone")["order_key"].nunique()
+        .rename("orders_last_90")
+    )
+    spend_last_90 = (
+        base_sales[base_sales["sales_day"] >= (reference_day - pd.Timedelta(days=90))]
+        .groupby("phone")["amount"].sum()
+        .rename("spend_last_90")
+    )
+
+    reorder_base = (
+        order_summary.sort_values(["phone", "sales_day"])
+        .drop_duplicates(["phone", "sales_day"])
+        .copy()
+    )
+    reorder_base["days_gap"] = reorder_base.groupby("phone")["sales_day"].diff().dt.days
+    reorder_profile = (
+        reorder_base.groupby("phone", as_index=False)
+        .agg(
+            avg_reorder_days=("days_gap", "mean"),
+            max_reorder_days=("days_gap", "max"),
+        )
+    )
+
+    customer_summary = customer_summary.merge(orders_last_30, on="phone", how="left")
+    customer_summary = customer_summary.merge(orders_last_60, on="phone", how="left")
+    customer_summary = customer_summary.merge(orders_last_90, on="phone", how="left")
+    customer_summary = customer_summary.merge(spend_last_90, on="phone", how="left")
+    customer_summary = customer_summary.merge(reorder_profile, on="phone", how="left")
+
+    fill_zero_columns = ["orders_last_30", "orders_last_60", "orders_last_90", "spend_last_90"]
+    customer_summary[fill_zero_columns] = customer_summary[fill_zero_columns].fillna(0)
+    customer_summary["avg_reorder_days"] = customer_summary["avg_reorder_days"].round(1)
+    customer_summary["max_reorder_days"] = customer_summary["max_reorder_days"].fillna(0).astype(int)
+
+    def classify_status(days_since_last: int) -> str:
+        if days_since_last > churn_days:
+            return "Churned"
+        if days_since_last > 30:
+            return "At Risk"
+        return "Active"
+
+    customer_summary["status"] = customer_summary["days_since_last_purchase"].apply(classify_status)
+    customer_summary["customer_segment"] = pd.cut(
+        customer_summary["total_spend"],
+        bins=[-float("inf"), 2000, 5000, 15000, float("inf")],
+        labels=["Low Value", "Growing", "Core", "VIP"],
+    ).astype(str)
+
+    if not item_frame.empty:
+        item_base = item_frame.copy()
+        item_base["sales_day"] = pd.to_datetime(item_base["sales_day"]).dt.normalize()
+
+        product_pref = (
+            item_base.groupby(["mob_no", "product_name"], as_index=False)
+            .agg(product_revenue=("net_amount", "sum"), product_qty=("qty", "sum"), last_bought=("sales_day", "max"))
+            .sort_values(["mob_no", "product_revenue", "product_qty"], ascending=[True, False, False])
+            .drop_duplicates("mob_no")
+            .rename(
+                columns={
+                    "mob_no": "phone",
+                    "product_name": "favorite_product",
+                    "product_revenue": "favorite_product_revenue",
+                    "last_bought": "favorite_product_last_bought",
+                }
+            )
+        )
+        category_pref = (
+            item_base[item_base["category_name"] != ""]
+            .groupby(["mob_no", "category_name"], as_index=False)
+            .agg(category_revenue=("net_amount", "sum"))
+            .sort_values(["mob_no", "category_revenue"], ascending=[True, False])
+            .drop_duplicates("mob_no")
+            .rename(columns={"mob_no": "phone", "category_name": "favorite_category"})
+        )
+        product_repeat = (
+            item_base.sort_values(["mob_no", "product_name", "sales_day"])
+            .drop_duplicates(["mob_no", "product_name", "sales_day"])
+            .copy()
+        )
+        product_repeat["product_gap"] = product_repeat.groupby(["mob_no", "product_name"])["sales_day"].diff().dt.days
+        product_repeat = (
+            product_repeat.groupby(["mob_no", "product_name"], as_index=False)
+            .agg(avg_product_repeat_days=("product_gap", "mean"), product_purchase_days=("sales_day", "nunique"))
+            .sort_values(["mob_no", "product_purchase_days", "avg_product_repeat_days"], ascending=[True, False, True])
+        )
+        product_repeat = product_repeat.drop_duplicates("mob_no").rename(
+            columns={"mob_no": "phone", "product_name": "repeat_anchor_product"}
+        )
+
+        customer_summary = customer_summary.merge(product_pref, on="phone", how="left")
+        customer_summary = customer_summary.merge(category_pref, on="phone", how="left")
+        customer_summary = customer_summary.merge(product_repeat, on="phone", how="left")
+
+    customer_summary["favorite_product_last_bought"] = pd.to_datetime(
+        customer_summary["favorite_product_last_bought"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    customer_summary["priority_score"] = (
+        customer_summary["total_spend"].rank(pct=True).fillna(0) * 50
+        + customer_summary["days_since_last_purchase"].clip(upper=120) / 120 * 30
+        + customer_summary["orders_last_90"].eq(0).astype(int) * 20
+    ).round(1)
+
+    def safe_label(value: object, fallback: str) -> str:
+        if pd.isna(value):
+            return fallback
+        text = str(value).strip()
+        return text if text else fallback
+
+    def action_hint(row: pd.Series) -> str:
+        repeat_product = safe_label(row.get("repeat_anchor_product"), "")
+        favorite_product = safe_label(row.get("favorite_product"), "")
+        favorite_category = safe_label(row.get("favorite_category"), "")
+        if row["status"] == "Churned":
+            target = repeat_product or favorite_product or "core staples"
+            return "Win-back on " + target
+        if row["status"] == "At Risk":
+            target = repeat_product or favorite_product or "recent products"
+            return "Reminder for " + target
+        target = favorite_category or "basket mix"
+        return "Upsell " + target
+
+    customer_summary["action_hint"] = customer_summary.apply(action_hint, axis=1)
+    return customer_summary.sort_values(["priority_score", "total_spend"], ascending=[False, False])
+
+
+def build_churn_summary_cards(profile: pd.DataFrame) -> Dict[str, float]:
+    if profile.empty:
+        return {
+            "Customers": 0,
+            "Active": 0,
+            "At Risk": 0,
+            "Churned": 0,
+            "Churn Rate %": 0.0,
+        }
+    total_customers = int(profile["phone"].nunique())
+    active = int((profile["status"] == "Active").sum())
+    at_risk = int((profile["status"] == "At Risk").sum())
+    churned = int((profile["status"] == "Churned").sum())
+    churn_rate = 0.0 if total_customers == 0 else (churned / total_customers) * 100
+    return {
+        "Customers": total_customers,
+        "Active": active,
+        "At Risk": at_risk,
+        "Churned": churned,
+        "Churn Rate %": round(churn_rate, 2),
+    }
+
+
+def build_churn_status_mix(profile: pd.DataFrame) -> pd.DataFrame:
+    if profile.empty:
+        return pd.DataFrame(columns=["status", "customers"])
+    return (
+        profile.groupby("status", as_index=False)
+        .agg(customers=("phone", "nunique"))
+        .sort_values("customers", ascending=False)
+    )
+
+
+def build_churn_segment_summary(profile: pd.DataFrame) -> pd.DataFrame:
+    if profile.empty:
+        return pd.DataFrame()
+    summary = (
+        profile.groupby(["customer_segment", "status"], as_index=False)
+        .agg(
+            customers=("phone", "nunique"),
+            revenue=("total_spend", "sum"),
+        )
+    )
+    return summary.sort_values(["customer_segment", "status"])
+
+
+def build_monthly_churn_trend(profile: pd.DataFrame) -> pd.DataFrame:
+    if profile.empty:
+        return pd.DataFrame()
+    trend = profile.copy()
+    trend["last_purchase_month"] = pd.to_datetime(trend["last_purchase"]).dt.to_period("M").dt.to_timestamp()
+    trend["month_label"] = trend["last_purchase_month"].dt.strftime("%Y-%m")
+    return (
+        trend.groupby(["month_label", "status"], as_index=False)
+        .agg(customers=("phone", "nunique"))
+        .sort_values("month_label")
+    )
+
+
+def build_churn_action_list(profile: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if profile.empty:
+        return pd.DataFrame()
+    action_list = profile[profile["status"].isin(["At Risk", "Churned"])].copy()
+    if action_list.empty:
+        return pd.DataFrame()
+    action_list["days_over_repeat_gap"] = (
+        action_list["days_since_last_purchase"] - action_list["avg_reorder_days"].fillna(action_list["days_since_last_purchase"])
+    ).round(1)
+    action_list = action_list.sort_values(
+        ["status", "priority_score", "days_since_last_purchase", "total_spend"],
+        ascending=[True, False, False, False],
+    )
+    return action_list.head(limit)
+
+
+def build_churn_reason_analysis(profile: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, float]]:
+    if profile.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {
+            "churned_customers": 0,
+            "one_time_pct": 0.0,
+            "no_orders_l90_pct": 0.0,
+            "cycle_break_pct": 0.0,
+        }
+
+    churned = profile[profile["status"] == "Churned"].copy()
+    if churned.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {
+            "churned_customers": 0,
+            "one_time_pct": 0.0,
+            "no_orders_l90_pct": 0.0,
+            "cycle_break_pct": 0.0,
+        }
+
+    churned["one_time_buyer"] = churned["total_orders"].le(1)
+    churned["no_orders_l90"] = churned["orders_last_90"].eq(0)
+    churned["repeat_cycle_broken"] = (
+        churned["avg_reorder_days"].notna()
+        & churned["avg_reorder_days"].gt(0)
+        & churned["days_since_last_purchase"].gt(churned["avg_reorder_days"] * 1.5)
+    )
+
+    def reason_tag(row: pd.Series) -> str:
+        if bool(row["one_time_buyer"]):
+            return "One-time buyer did not return"
+        if bool(row["no_orders_l90"]):
+            return "No orders in last 90 days"
+        if bool(row["repeat_cycle_broken"]):
+            return "Missed expected reorder cycle"
+        if str(row.get("customer_segment", "")) == "Low Value":
+            return "Low-value sporadic behavior"
+        return "Needs manual review"
+
+    churned["primary_churn_reason"] = churned.apply(reason_tag, axis=1)
+
+    reason_summary = (
+        churned.groupby("primary_churn_reason", as_index=False)
+        .agg(
+            customers=("phone", "nunique"),
+            revenue_lost=("total_spend", "sum"),
+            avg_days_since_last=("days_since_last_purchase", "mean"),
+        )
+        .sort_values(["customers", "revenue_lost"], ascending=[False, False])
+    )
+    reason_summary["avg_days_since_last"] = reason_summary["avg_days_since_last"].round(1)
+
+    category_risk = (
+        churned[churned["favorite_category"].notna() & churned["favorite_category"].astype(str).ne("")]
+        .groupby("favorite_category", as_index=False)
+        .agg(
+            churned_customers=("phone", "nunique"),
+            churned_revenue=("total_spend", "sum"),
+        )
+        .sort_values(["churned_customers", "churned_revenue"], ascending=[False, False])
+    )
+
+    total_churned = max(int(churned["phone"].nunique()), 1)
+    metrics = {
+        "churned_customers": int(churned["phone"].nunique()),
+        "one_time_pct": round((float(churned["one_time_buyer"].sum()) / total_churned) * 100, 2),
+        "no_orders_l90_pct": round((float(churned["no_orders_l90"].sum()) / total_churned) * 100, 2),
+        "cycle_break_pct": round((float(churned["repeat_cycle_broken"].sum()) / total_churned) * 100, 2),
+    }
+    return reason_summary, churned, category_risk, metrics
+
+
+def render_churn_definitions(churn_days: int) -> None:
+    with st.expander("Definitions", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    f"- `Churned`: customer whose `Days Since Last Purchase` is more than `{churn_days}` days.",
+                    "- `At Risk`: customer with no purchase in the last `31-60` days.",
+                    "- `Active`: customer with a purchase in the last `0-30` days.",
+                    "- `Days Since Last Purchase`: number of days from selected end date to latest purchase date.",
+                    "- `Avg Reorder Days`: average gap in days between customer orders.",
+                    "- `Days Over Repeat Gap`: `Days Since Last Purchase - Avg Reorder Days`.",
+                    "- `Total Orders`: distinct order count for that customer (non-walkin, non-B2B scope).",
+                    "- `Total Spend`: total revenue generated by that customer in scope.",
+                    "- `AOV`: Average Order Value (`Total Spend / Total Orders`).",
+                    "- `Orders L30 / L60 / L90`: distinct orders in last 30/60/90 days.",
+                    "- `Favorite Category`: category with highest revenue contribution for that customer.",
+                    "- `Favorite Product`: product with highest revenue contribution for that customer.",
+                    "- `Repeat Product`: most stable repeatedly bought product for that customer.",
+                    "- `Priority Score`: ranking score to prioritize follow-up; higher means higher attention needed.",
+                    "- `Action Hint`: suggested next action (reminder, win-back, or upsell direction).",
+                ]
+            )
+        )
 
 
 def check_local_db_ready() -> bool:
     try:
-        connection = sqlite3.connect(str(DEFAULT_DB_FILE))
-        try:
-            exists = pd.read_sql_query(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type = 'table' AND name = 'sales_raw'
-                """,
-                connection,
-            )
-        finally:
-            connection.close()
-    except sqlite3.Error:
+        config = load_target_supabase_config()
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(
+            f"{config.url}/rest/v1/{SUPABASE_SALES_RAW_TABLE}",
+            headers=supabase_headers(config, {"Prefer": "count=exact"}),
+            params={"select": "sales_no", "limit": 1},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except Exception:
         return False
-    return not exists.empty
+    return True
 
 
 def local_db_has_sales_rows() -> bool:
     if not check_local_db_ready():
         return False
     try:
-        connection = sqlite3.connect(str(DEFAULT_DB_FILE))
-        try:
-            count_df = pd.read_sql_query("SELECT COUNT(*) AS row_count FROM sales_raw", connection)
-        finally:
-            connection.close()
+        count_df = load_supabase_table(SUPABASE_SALES_RAW_TABLE, "id")
     except Exception:
         return False
-    return bool(int(count_df["row_count"].iloc[0]) > 0)
+    return not count_df.empty
 
 
 def run_pipeline_command(*extra_args: str) -> Tuple[bool, str]:
@@ -356,6 +927,29 @@ def build_product_summary(frame: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
+def build_category_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=["category_name", "qty", "revenue", "orders", "customers", "customer_penetration"])
+
+    category_frame = frame[frame["category_name"] != ""].copy()
+    if category_frame.empty:
+        return pd.DataFrame(columns=["category_name", "qty", "revenue", "orders", "customers", "customer_penetration"])
+
+    total_customers = max(category_frame.loc[category_frame["mob_no"].ne(WALKIN_PLACEHOLDER), "mob_no"].nunique(), 1)
+    summary = (
+        category_frame.groupby("category_name", as_index=False)
+        .agg(
+            qty=("qty", "sum"),
+            revenue=("net_amount", "sum"),
+            orders=("sales_no", "nunique"),
+            customers=("mob_no", lambda values: values[values != WALKIN_PLACEHOLDER].nunique()),
+        )
+        .sort_values(["customers", "revenue", "qty"], ascending=[False, False, False])
+    )
+    summary["customer_penetration"] = (summary["customers"] / total_customers) * 100
+    return summary
+
+
 def compare_product_summary(current_frame: pd.DataFrame, previous_frame: pd.DataFrame) -> pd.DataFrame:
     current_summary = build_product_summary(current_frame)
     previous_summary = build_product_summary(previous_frame)
@@ -386,6 +980,33 @@ def compare_product_summary(current_frame: pd.DataFrame, previous_frame: pd.Data
     return merged.sort_values(["revenue_change", "qty_change"], ascending=[False, False])
 
 
+def compare_category_summary(current_frame: pd.DataFrame, previous_frame: pd.DataFrame) -> pd.DataFrame:
+    current_summary = build_category_summary(current_frame)
+    previous_summary = build_category_summary(previous_frame)
+    merged = current_summary.merge(
+        previous_summary,
+        on="category_name",
+        how="outer",
+        suffixes=("_current", "_previous"),
+    ).fillna(0)
+    merged["qty_change"] = merged["qty_current"] - merged["qty_previous"]
+    merged["revenue_change"] = merged["revenue_current"] - merged["revenue_previous"]
+    merged["orders_change"] = merged["orders_current"] - merged["orders_previous"]
+    merged["customers_change"] = merged["customers_current"] - merged["customers_previous"]
+    merged["customer_penetration_change"] = (
+        merged["customer_penetration_current"] - merged["customer_penetration_previous"]
+    )
+    merged["revenue_change_pct"] = merged.apply(
+        lambda row: 0.0 if row["revenue_previous"] == 0 else (row["revenue_change"] / row["revenue_previous"]) * 100,
+        axis=1,
+    )
+    merged["qty_change_pct"] = merged.apply(
+        lambda row: 0.0 if row["qty_previous"] == 0 else (row["qty_change"] / row["qty_previous"]) * 100,
+        axis=1,
+    )
+    return merged.sort_values(["customers_change", "revenue_change"], ascending=[False, False])
+
+
 def build_product_penetration_cards(comparison: pd.DataFrame) -> Dict[str, str]:
     if comparison.empty:
         return {
@@ -407,6 +1028,27 @@ def build_product_penetration_cards(comparison: pd.DataFrame) -> Dict[str, str]:
     }
 
 
+def build_category_penetration_cards(comparison: pd.DataFrame) -> Dict[str, str]:
+    if comparison.empty:
+        return {
+            "Top Customer Gainer": "N/A",
+            "Top Customer Drop": "N/A",
+            "Top Revenue Driver": "N/A",
+            "Top Penetration Gainer": "N/A",
+        }
+
+    top_customers = comparison.sort_values("customers_change", ascending=False).iloc[0]
+    top_drop = comparison.sort_values("customers_change", ascending=True).iloc[0]
+    top_revenue = comparison.sort_values("revenue_change", ascending=False).iloc[0]
+    top_pen = comparison.sort_values("customer_penetration_change", ascending=False).iloc[0]
+    return {
+        "Top Customer Gainer": f"{top_customers['category_name']} ({top_customers['customers_change']:,.0f})",
+        "Top Customer Drop": f"{top_drop['category_name']} ({top_drop['customers_change']:,.0f})",
+        "Top Revenue Driver": f"{top_revenue['category_name']} ({top_revenue['revenue_change']:,.0f})",
+        "Top Penetration Gainer": f"{top_pen['category_name']} ({top_pen['customer_penetration_change']:.2f} pts)",
+    }
+
+
 def build_product_change_summary(comparison: pd.DataFrame) -> Dict[str, float]:
     if comparison.empty:
         return {
@@ -425,6 +1067,27 @@ def build_product_change_summary(comparison: pd.DataFrame) -> Dict[str, float]:
         "Products Decreased": decreased,
         "New This Period": new_products,
         "Dropped vs Last Month": dropped_products,
+    }
+
+
+def build_category_change_summary(comparison: pd.DataFrame) -> Dict[str, float]:
+    if comparison.empty:
+        return {
+            "Categories Increased": 0,
+            "Categories Decreased": 0,
+            "New This Period": 0,
+            "Dropped vs Last Month": 0,
+        }
+
+    increased = int((comparison["customers_change"] > 0).sum())
+    decreased = int((comparison["customers_change"] < 0).sum())
+    new_categories = int(((comparison["customers_current"] > 0) & (comparison["customers_previous"] == 0)).sum())
+    dropped_categories = int(((comparison["customers_current"] == 0) & (comparison["customers_previous"] > 0)).sum())
+    return {
+        "Categories Increased": increased,
+        "Categories Decreased": decreased,
+        "New This Period": new_categories,
+        "Dropped vs Last Month": dropped_categories,
     }
 
 
@@ -458,6 +1121,42 @@ def style_product_comparison_table(frame: pd.DataFrame):
     return (
         frame.style.format(format_map)
         .applymap(change_bg, subset=["Qty Change", "Revenue Change", "Order Penetration Change"])
+    )
+
+
+def style_category_comparison_table(frame: pd.DataFrame):
+    if frame.empty:
+        return frame
+
+    def change_bg(value: float) -> str:
+        if value > 0:
+            return "background-color: #e8f7ea; color: #146c2e;"
+        if value < 0:
+            return "background-color: #fdecec; color: #b42318;"
+        return ""
+
+    format_map = {
+        "Current Qty": "{:,.0f}",
+        "Previous Qty": "{:,.0f}",
+        "Qty Change": "{:,.0f}",
+        "Qty Change %": "{:,.2f}%",
+        "Current Revenue": "{:,.2f}",
+        "Previous Revenue": "{:,.2f}",
+        "Revenue Change": "{:,.2f}",
+        "Revenue Change %": "{:,.2f}%",
+        "Current Orders": "{:,.0f}",
+        "Previous Orders": "{:,.0f}",
+        "Current Customers": "{:,.0f}",
+        "Previous Customers": "{:,.0f}",
+        "Customers Change": "{:,.0f}",
+        "Current Customer Penetration %": "{:,.2f}%",
+        "Previous Customer Penetration %": "{:,.2f}%",
+        "Customer Penetration Change": "{:,.2f}",
+    }
+
+    return (
+        frame.style.format(format_map)
+        .applymap(change_bg, subset=["Qty Change", "Revenue Change", "Customers Change", "Customer Penetration Change"])
     )
 
 
@@ -1443,7 +2142,7 @@ def apply_quick_range(choice: str, today_value: date) -> Tuple[date, date]:
 
 st.set_page_config(page_title="MIS Reporting Dashboard", layout="wide")
 st.title("MIS Reporting Dashboard")
-st.caption("Live historical + latest cleaned sales from local SQLite")
+st.caption("Live historical + latest cleaned sales from Supabase")
 
 refresh_col, rebuild_col, status_col = st.columns([0.18, 0.22, 0.60])
 with refresh_col:
@@ -1472,12 +2171,15 @@ with rebuild_col:
             st.code(message)
 
 if not check_local_db_ready():
-    st.info("Run `python sales_pipeline.py` first so the local SQLite tables are created.")
+    st.info(
+        "Supabase backup tables are not reachable yet. "
+        "Run `python sales_pipeline.py --target-sync-from-local --truncate-target-first` and verify keys."
+    )
     st.stop()
 
 all_sales_df = load_sales_data()
 if all_sales_df.empty:
-    st.info("No rows found in local historical data.")
+    st.info("No rows found in Supabase historical data.")
     st.stop()
 
 default_end = all_sales_df["sales_day"].max().date()
@@ -1591,6 +2293,8 @@ page_options = [
     "Revenue Repeat",
     "Revenue vs Last Month",
     "Product Penetration",
+    "Persona",
+    "Churn Dashboard",
     "Monthly Wallet",
     "Customer Count Branch Wise",
     "Order Repeat",
@@ -1902,7 +2606,14 @@ if selected_page == "Revenue vs Last Month":
         st.plotly_chart(customer_chart, use_container_width=True)
 
 if selected_page == "Product Penetration":
-    product_df = load_product_penetration_data()
+    product_query_start = min(start_date, shift_date_one_month(start_date)).strftime("%Y-%m-%d 00:00:00")
+    product_query_end = max(end_date, shift_date_one_month(end_date)).strftime("%Y-%m-%d 23:59:59")
+    product_df = load_product_penetration_data(
+        product_query_start,
+        product_query_end,
+        selected_branch,
+        selected_type,
+    )
     if product_df.empty:
         st.info("No joined product rows found.")
     else:
@@ -1920,31 +2631,6 @@ if selected_page == "Product Penetration":
             & (product_df["sales_day"].dt.date <= previous_end)
         ].copy()
 
-        if selected_branch != "All Branches":
-            product_filtered = product_filtered[product_filtered["branch_code"] == selected_branch]
-            product_previous = product_previous[product_previous["branch_code"] == selected_branch]
-        if selected_type != "All Types":
-            type_value = "" if selected_type == "Unspecified" else selected_type
-            product_filtered = product_filtered[product_filtered["order_type"] == type_value]
-            product_previous = product_previous[product_previous["order_type"] == type_value]
-
-        product_options = ["All Products"] + sorted(
-            set(product_filtered["product_name"].dropna().astype(str).tolist())
-            | set(product_previous["product_name"].dropna().astype(str).tolist())
-        )
-        selected_product = st.selectbox(
-            "Product Name",
-            product_options,
-            index=0,
-        )
-        if selected_product != "All Products":
-            product_filtered = product_filtered[product_filtered["product_name"] == selected_product]
-            product_previous = product_previous[product_previous["product_name"] == selected_product]
-
-        product_comparison = compare_product_summary(product_filtered, product_previous)
-        product_cards = build_product_penetration_cards(product_comparison)
-        product_change_summary = build_product_change_summary(product_comparison)
-
         st.subheader("Product Penetration")
         st.caption(
             "Current period: "
@@ -1955,141 +2641,352 @@ if selected_page == "Product Penetration":
         st.caption(
             "This means if your filter is April 1 to April 15, it compares exactly against March 1 to March 15."
         )
+        customer_filter_options = [
+            "All Customers",
+            "Exclude New Customers",
+            "Exclude One-Time Customers",
+        ]
+        selected_customer_filter = st.selectbox(
+            "Customer filter",
+            customer_filter_options,
+            index=0,
+            key="penetration_customer_filter",
+        )
 
-        card_cols = st.columns(4)
-        for column, (label, value) in zip(card_cols, product_cards.items()):
-            column.metric(label, value)
+        if selected_customer_filter == "Exclude New Customers":
+            product_filtered = product_filtered[~product_filtered["is_new_customer"]].copy()
+            product_previous = product_previous[~product_previous["is_new_customer"]].copy()
+        elif selected_customer_filter == "Exclude One-Time Customers":
+            product_filtered = product_filtered[~product_filtered["is_one_time_customer"]].copy()
+            product_previous = product_previous[~product_previous["is_one_time_customer"]].copy()
 
-        if product_comparison.empty:
-            st.info("No product rows found for the selected filters.")
-        else:
-            summary_cols = st.columns(4)
-            for column, (label, value) in zip(summary_cols, product_change_summary.items()):
-                column.metric(label, f"{value:,}")
+        product_tab, category_tab = st.tabs(["Product Level", "Category Level"])
 
-            sort_labels = {
-                "Revenue Increase": "revenue_change",
-                "Revenue Decrease": "revenue_change",
-                "Qty Increase": "qty_change",
-                "Penetration Increase": "order_penetration_change",
-            }
-            selected_sort = st.selectbox(
-                "Highlight movement by",
-                list(sort_labels.keys()),
+        with product_tab:
+            product_current = product_filtered.copy()
+            product_last_month = product_previous.copy()
+            product_options = ["All Products"] + sorted(
+                set(product_current["product_name"].dropna().astype(str).tolist())
+                | set(product_last_month["product_name"].dropna().astype(str).tolist())
+            )
+            selected_product = st.selectbox(
+                "Product Name",
+                product_options,
                 index=0,
+                key="product_penetration_filter",
             )
+            if selected_product != "All Products":
+                product_current = product_current[product_current["product_name"] == selected_product]
+                product_last_month = product_last_month[product_last_month["product_name"] == selected_product]
+
+            product_comparison = compare_product_summary(product_current, product_last_month)
+            product_cards = build_product_penetration_cards(product_comparison)
+            product_change_summary = build_product_change_summary(product_comparison)
+
+            card_cols = st.columns(4)
+            for column, (label, value) in zip(card_cols, product_cards.items()):
+                column.metric(label, value)
+
+            if product_comparison.empty:
+                st.info("No product rows found for the selected filters.")
+            else:
+                summary_cols = st.columns(4)
+                for column, (label, value) in zip(summary_cols, product_change_summary.items()):
+                    column.metric(label, f"{value:,}")
+
+                sort_labels = {
+                    "Revenue Increase": "revenue_change",
+                    "Revenue Decrease": "revenue_change",
+                    "Qty Increase": "qty_change",
+                    "Penetration Increase": "order_penetration_change",
+                }
+                selected_sort = st.selectbox(
+                    "Highlight movement by",
+                    list(sort_labels.keys()),
+                    index=0,
+                    key="product_penetration_sort",
+                )
+                st.caption(
+                    "Revenue Increase: shows products that added the most revenue vs last month at the top.\n"
+                    "Revenue Decrease: shows products that lost the most revenue vs last month at the top.\n"
+                    "Qty Increase: shows products whose sold quantity increased the most vs last month.\n"
+                    "Penetration Increase: shows products whose penetration improved the most."
+                )
+                sort_column = sort_labels[selected_sort]
+                ascending = selected_sort == "Revenue Decrease"
+                display_comparison = product_comparison.sort_values(sort_column, ascending=ascending).copy()
+
+                order_current = int(product_current["sales_no"].replace("", pd.NA).nunique())
+                order_previous = int(product_last_month["sales_no"].replace("", pd.NA).nunique())
+                order_cols = st.columns(2)
+                order_cols[0].metric("Current Distinct Order Count", f"{order_current:,}")
+                order_cols[1].metric("Previous Distinct Order Count", f"{order_previous:,}")
+
+                top_left, top_right = st.columns(2)
+                with top_left:
+                    st.markdown("**Top Revenue Movers**")
+                    revenue_chart_source = product_comparison.reindex(
+                        product_comparison["revenue_change"].abs().sort_values(ascending=False).index
+                    ).head(12)
+                    revenue_chart = px.bar(
+                        revenue_chart_source.sort_values("revenue_change"),
+                        x="revenue_change",
+                        y="product_name",
+                        orientation="h",
+                        color="revenue_change",
+                        color_continuous_scale="RdYlGn",
+                    )
+                    revenue_chart.update_layout(xaxis_title="Revenue Change", yaxis_title=None, coloraxis_showscale=False)
+                    st.plotly_chart(revenue_chart, use_container_width=True)
+
+                with top_right:
+                    st.markdown("**Top Quantity Movers**")
+                    qty_chart_source = product_comparison.reindex(
+                        product_comparison["qty_change"].abs().sort_values(ascending=False).index
+                    ).head(12)
+                    qty_chart = px.bar(
+                        qty_chart_source.sort_values("qty_change"),
+                        x="qty_change",
+                        y="product_name",
+                        orientation="h",
+                        color="qty_change",
+                        color_continuous_scale="RdYlGn",
+                    )
+                    qty_chart.update_layout(xaxis_title="Qty Change", yaxis_title=None, coloraxis_showscale=False)
+                    st.plotly_chart(qty_chart, use_container_width=True)
+
+                lower_left, lower_right = st.columns([1.4, 1.0])
+                with lower_left:
+                    st.markdown("**Product Comparison Table**")
+                    table_view = display_comparison.rename(
+                        columns={
+                            "product_name": "Product Name",
+                            "qty_current": "Current Qty",
+                            "qty_previous": "Previous Qty",
+                            "qty_change": "Qty Change",
+                            "qty_change_pct": "Qty Change %",
+                            "revenue_current": "Current Revenue",
+                            "revenue_previous": "Previous Revenue",
+                            "revenue_change": "Revenue Change",
+                            "revenue_change_pct": "Revenue Change %",
+                            "orders_current": "Current Orders",
+                            "orders_previous": "Previous Orders",
+                            "order_penetration_current": "Current Order Penetration %",
+                            "order_penetration_previous": "Previous Order Penetration %",
+                            "order_penetration_change": "Order Penetration Change",
+                        }
+                    )
+                    table_view = table_view[
+                        [
+                            "Product Name",
+                            "Current Qty",
+                            "Previous Qty",
+                            "Qty Change",
+                            "Qty Change %",
+                            "Current Revenue",
+                            "Previous Revenue",
+                            "Revenue Change",
+                            "Revenue Change %",
+                            "Current Orders",
+                            "Previous Orders",
+                            "Current Order Penetration %",
+                            "Previous Order Penetration %",
+                            "Order Penetration Change",
+                        ]
+                    ].head(50).set_index("Product Name")
+                    st.dataframe(
+                        style_product_comparison_table(
+                            table_view
+                        ),
+                        use_container_width=True,
+                        hide_index=False,
+                    )
+
+                with lower_right:
+                    st.markdown("**Revenue vs Penetration Change**")
+                    scatter_chart = px.scatter(
+                        display_comparison.head(60),
+                        x="order_penetration_change",
+                        y="revenue_change",
+                        size="qty_current",
+                        hover_name="product_name",
+                        color="revenue_change",
+                        color_continuous_scale="RdYlGn",
+                    )
+                    scatter_chart.update_layout(
+                        xaxis_title="Order Penetration Change (pts)",
+                        yaxis_title="Revenue Change",
+                        coloraxis_showscale=False,
+                    )
+                    st.plotly_chart(scatter_chart, use_container_width=True)
+
+        with category_tab:
+            category_current = product_filtered[product_filtered["category_name"] != ""].copy()
+            category_previous = product_previous[product_previous["category_name"] != ""].copy()
+
+            category_options = ["All Categories"] + sorted(
+                set(category_current["category_name"].dropna().astype(str).tolist())
+                | set(category_previous["category_name"].dropna().astype(str).tolist())
+            )
+            selected_category = st.selectbox(
+                "Category Name",
+                category_options,
+                index=0,
+                key="category_penetration_filter",
+            )
+            if selected_category != "All Categories":
+                category_current = category_current[category_current["category_name"] == selected_category]
+                category_previous = category_previous[category_previous["category_name"] == selected_category]
+
+            category_comparison = compare_category_summary(category_current, category_previous)
+            category_cards = build_category_penetration_cards(category_comparison)
+            category_change_summary = build_category_change_summary(category_comparison)
+
             st.caption(
-                "Revenue Increase: shows products that added the most revenue vs last month at the top.\n"
-                "Revenue Decrease: shows products that lost the most revenue vs last month at the top.\n"
-                "Qty Increase: shows products whose sold quantity increased the most vs last month.\n"
-                "Penetration Increase: shows products whose penetration improved the most."
+                "Category-level penetration is calculated using distinct phone numbers from clean data. "
+                "Walk-ins are excluded from the penetration base."
             )
-            sort_column = sort_labels[selected_sort]
-            ascending = selected_sort == "Revenue Decrease"
-            display_comparison = product_comparison.sort_values(sort_column, ascending=ascending).copy()
 
-            order_current = int(product_filtered["sales_no"].replace("", pd.NA).nunique())
-            order_previous = int(product_previous["sales_no"].replace("", pd.NA).nunique())
-            order_cols = st.columns(2)
-            order_cols[0].metric("Current Distinct Order Count", f"{order_current:,}")
-            order_cols[1].metric("Previous Distinct Order Count", f"{order_previous:,}")
+            card_cols = st.columns(4)
+            for column, (label, value) in zip(card_cols, category_cards.items()):
+                column.metric(label, value)
 
-            top_left, top_right = st.columns(2)
-            with top_left:
-                st.markdown("**Top Revenue Movers**")
-                revenue_chart_source = product_comparison.reindex(
-                    product_comparison["revenue_change"].abs().sort_values(ascending=False).index
-                ).head(12)
-                revenue_chart = px.bar(
-                    revenue_chart_source.sort_values("revenue_change"),
-                    x="revenue_change",
-                    y="product_name",
-                    orientation="h",
-                    color="revenue_change",
-                    color_continuous_scale="RdYlGn",
-                )
-                revenue_chart.update_layout(xaxis_title="Revenue Change", yaxis_title=None, coloraxis_showscale=False)
-                st.plotly_chart(revenue_chart, use_container_width=True)
+            if category_comparison.empty:
+                st.info("No category rows found for the selected filters.")
+            else:
+                summary_cols = st.columns(4)
+                for column, (label, value) in zip(summary_cols, category_change_summary.items()):
+                    column.metric(label, f"{value:,}")
 
-            with top_right:
-                st.markdown("**Top Quantity Movers**")
-                qty_chart_source = product_comparison.reindex(
-                    product_comparison["qty_change"].abs().sort_values(ascending=False).index
-                ).head(12)
-                qty_chart = px.bar(
-                    qty_chart_source.sort_values("qty_change"),
-                    x="qty_change",
-                    y="product_name",
-                    orientation="h",
-                    color="qty_change",
-                    color_continuous_scale="RdYlGn",
+                sort_labels = {
+                    "Customer Increase": "customers_change",
+                    "Customer Decrease": "customers_change",
+                    "Revenue Increase": "revenue_change",
+                    "Penetration Increase": "customer_penetration_change",
+                }
+                selected_sort = st.selectbox(
+                    "Highlight category movement by",
+                    list(sort_labels.keys()),
+                    index=0,
+                    key="category_penetration_sort",
                 )
-                qty_chart.update_layout(xaxis_title="Qty Change", yaxis_title=None, coloraxis_showscale=False)
-                st.plotly_chart(qty_chart, use_container_width=True)
+                sort_column = sort_labels[selected_sort]
+                ascending = selected_sort == "Customer Decrease"
+                display_comparison = category_comparison.sort_values(sort_column, ascending=ascending).copy()
 
-            lower_left, lower_right = st.columns([1.4, 1.0])
-            with lower_left:
-                st.markdown("**Product Comparison Table**")
-                table_view = display_comparison.rename(
-                    columns={
-                        "product_name": "Product Name",
-                        "qty_current": "Current Qty",
-                        "qty_previous": "Previous Qty",
-                        "qty_change": "Qty Change",
-                        "qty_change_pct": "Qty Change %",
-                        "revenue_current": "Current Revenue",
-                        "revenue_previous": "Previous Revenue",
-                        "revenue_change": "Revenue Change",
-                        "revenue_change_pct": "Revenue Change %",
-                        "orders_current": "Current Orders",
-                        "orders_previous": "Previous Orders",
-                        "order_penetration_current": "Current Order Penetration %",
-                        "order_penetration_previous": "Previous Order Penetration %",
-                        "order_penetration_change": "Order Penetration Change",
-                    }
-                )
-                st.dataframe(
-                    style_product_comparison_table(
-                        table_view[
-                            [
-                                "Product Name",
-                                "Current Qty",
-                                "Previous Qty",
-                                "Qty Change",
-                                "Qty Change %",
-                                "Current Revenue",
-                                "Previous Revenue",
-                                "Revenue Change",
-                                "Revenue Change %",
-                                "Current Orders",
-                                "Previous Orders",
-                                "Current Order Penetration %",
-                                "Previous Order Penetration %",
-                                "Order Penetration Change",
-                            ]
-                        ].head(50)
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                customer_current = int(category_current.loc[category_current["mob_no"].ne(WALKIN_PLACEHOLDER), "mob_no"].nunique())
+                customer_previous = int(category_previous.loc[category_previous["mob_no"].ne(WALKIN_PLACEHOLDER), "mob_no"].nunique())
+                customer_cols = st.columns(2)
+                customer_cols[0].metric("Current Distinct Phone Count", f"{customer_current:,}")
+                customer_cols[1].metric("Previous Distinct Phone Count", f"{customer_previous:,}")
 
-            with lower_right:
-                st.markdown("**Revenue vs Penetration Change**")
-                scatter_chart = px.scatter(
-                    display_comparison.head(60),
-                    x="order_penetration_change",
-                    y="revenue_change",
-                    size="qty_current",
-                    hover_name="product_name",
-                    color="revenue_change",
-                    color_continuous_scale="RdYlGn",
-                )
-                scatter_chart.update_layout(
-                    xaxis_title="Order Penetration Change (pts)",
-                    yaxis_title="Revenue Change",
-                    coloraxis_showscale=False,
-                )
-                st.plotly_chart(scatter_chart, use_container_width=True)
+                top_left, top_right = st.columns(2)
+                with top_left:
+                    st.markdown("**Top Category Customer Movers**")
+                    customer_chart_source = category_comparison.reindex(
+                        category_comparison["customers_change"].abs().sort_values(ascending=False).index
+                    ).head(12)
+                    customer_chart = px.bar(
+                        customer_chart_source.sort_values("customers_change"),
+                        x="customers_change",
+                        y="category_name",
+                        orientation="h",
+                        color="customers_change",
+                        color_continuous_scale="RdYlGn",
+                    )
+                    customer_chart.update_layout(xaxis_title="Customer Change", yaxis_title=None, coloraxis_showscale=False)
+                    st.plotly_chart(customer_chart, use_container_width=True)
+
+                with top_right:
+                    st.markdown("**Top Category Penetration Gainers**")
+                    penetration_chart_source = category_comparison.reindex(
+                        category_comparison["customer_penetration_change"].abs().sort_values(ascending=False).index
+                    ).head(12)
+                    penetration_chart = px.bar(
+                        penetration_chart_source.sort_values("customer_penetration_change"),
+                        x="customer_penetration_change",
+                        y="category_name",
+                        orientation="h",
+                        color="customer_penetration_change",
+                        color_continuous_scale="RdYlGn",
+                    )
+                    penetration_chart.update_layout(
+                        xaxis_title="Penetration Change (pts)",
+                        yaxis_title=None,
+                        coloraxis_showscale=False,
+                    )
+                    st.plotly_chart(penetration_chart, use_container_width=True)
+
+                lower_left, lower_right = st.columns([1.4, 1.0])
+                with lower_left:
+                    st.markdown("**Category Comparison Table**")
+                    table_view = display_comparison.rename(
+                        columns={
+                            "category_name": "Category Name",
+                            "qty_current": "Current Qty",
+                            "qty_previous": "Previous Qty",
+                            "qty_change": "Qty Change",
+                            "qty_change_pct": "Qty Change %",
+                            "revenue_current": "Current Revenue",
+                            "revenue_previous": "Previous Revenue",
+                            "revenue_change": "Revenue Change",
+                            "revenue_change_pct": "Revenue Change %",
+                            "orders_current": "Current Orders",
+                            "orders_previous": "Previous Orders",
+                            "customers_current": "Current Customers",
+                            "customers_previous": "Previous Customers",
+                            "customers_change": "Customers Change",
+                            "customer_penetration_current": "Current Customer Penetration %",
+                            "customer_penetration_previous": "Previous Customer Penetration %",
+                            "customer_penetration_change": "Customer Penetration Change",
+                        }
+                    )
+                    table_view = table_view[
+                        [
+                            "Category Name",
+                            "Current Qty",
+                            "Previous Qty",
+                            "Qty Change",
+                            "Qty Change %",
+                            "Current Revenue",
+                            "Previous Revenue",
+                            "Revenue Change",
+                            "Revenue Change %",
+                            "Current Orders",
+                            "Previous Orders",
+                            "Current Customers",
+                            "Previous Customers",
+                            "Customers Change",
+                            "Current Customer Penetration %",
+                            "Previous Customer Penetration %",
+                            "Customer Penetration Change",
+                        ]
+                    ].head(50).set_index("Category Name")
+                    st.dataframe(
+                        style_category_comparison_table(
+                            table_view
+                        ),
+                        use_container_width=True,
+                        hide_index=False,
+                    )
+
+                with lower_right:
+                    st.markdown("**Revenue vs Penetration Change**")
+                    scatter_chart = px.scatter(
+                        display_comparison.head(60),
+                        x="customer_penetration_change",
+                        y="revenue_change",
+                        size="customers_current",
+                        hover_name="category_name",
+                        color="customers_change",
+                        color_continuous_scale="RdYlGn",
+                    )
+                    scatter_chart.update_layout(
+                        xaxis_title="Customer Penetration Change (pts)",
+                        yaxis_title="Revenue Change",
+                        coloraxis_showscale=False,
+                    )
+                    st.plotly_chart(scatter_chart, use_container_width=True)
 
 if selected_page == "Monthly Wallet":
     wallet_source = branch_filtered_df.copy()
@@ -2100,6 +2997,469 @@ if selected_page == "Monthly Wallet":
         st.info("No monthly wallet rows found for the selected filters.")
     else:
         st.dataframe(style_currency_matrix(monthly_wallet), use_container_width=True)
+
+if selected_page == "Persona":
+    persona_source = load_persona_item_data(selected_branch, selected_type)
+
+    st.subheader("Persona")
+    st.caption(
+        "Enter a phone number to see the customer's product mix, repeat buying gap by product, "
+        "and personalized product follow-up suggestions."
+    )
+
+    if persona_source.empty:
+        st.info("No item-level customer rows found for the selected branch/type filters.")
+    else:
+        input_col, number_col = st.columns([1.2, 0.6])
+        with input_col:
+            persona_phone = st.text_input("Phone Number", placeholder="Enter customer phone number")
+        with number_col:
+            recommendation_limit = st.number_input(
+                "Products to show",
+                min_value=1,
+                max_value=20,
+                value=5,
+                step=1,
+            )
+
+        normalized_phone = str(persona_phone).strip()
+        if not normalized_phone:
+            st.info("Enter a phone number to generate personalization.")
+        else:
+            customer_frame = persona_source[persona_source["mob_no"] == normalized_phone].copy()
+            if customer_frame.empty:
+                st.warning("No customer history found for that phone number in the filtered data.")
+            else:
+                product_mix = build_persona_product_mix(customer_frame)
+                repeat_profile = build_persona_repeat_profile(customer_frame)
+                recommendations = build_persona_recommendations(customer_frame, int(recommendation_limit))
+
+                first_purchase = customer_frame["sales_day"].min()
+                last_purchase = customer_frame["sales_day"].max()
+                total_orders = int(customer_frame["sales_no"].replace("", pd.NA).nunique())
+                total_spend = float(customer_frame["net_amount"].sum())
+                unique_products = int(customer_frame["product_name"].nunique())
+
+                metric_cols = st.columns(5)
+                metric_cols[0].metric("Phone", normalized_phone)
+                metric_cols[1].metric("Orders", f"{total_orders:,}")
+                metric_cols[2].metric("Spend", f"{total_spend:,.2f}")
+                metric_cols[3].metric("Unique Products", f"{unique_products:,}")
+                metric_cols[4].metric(
+                    "Active Window",
+                    f"{int((last_purchase - first_purchase).days):,} days",
+                )
+
+                top_left, top_right = st.columns([1.3, 1.0])
+                with top_left:
+                    st.markdown("**Product Wise Product Mix**")
+                    mix_view = product_mix.rename(
+                        columns={
+                            "product_name": "Product",
+                            "category_name": "Category",
+                            "qty": "Qty",
+                            "revenue": "Revenue",
+                            "orders": "Orders",
+                            "revenue_mix_pct": "Revenue Mix %",
+                            "last_bought": "Last Bought",
+                        }
+                    )
+                    st.dataframe(mix_view.head(int(recommendation_limit)), use_container_width=True, hide_index=True)
+
+                with top_right:
+                    st.markdown("**Revenue Mix Chart**")
+                    mix_chart_source = product_mix.head(int(recommendation_limit)).copy()
+                    mix_chart = px.pie(
+                        mix_chart_source,
+                        names="product_name",
+                        values="revenue",
+                    )
+                    st.plotly_chart(mix_chart, use_container_width=True)
+
+                bottom_left, bottom_right = st.columns([1.3, 1.0])
+                with bottom_left:
+                    st.markdown("**Average Days To Buy Again By Product**")
+                    if repeat_profile.empty:
+                        st.info("No repeat-product pattern found for this customer yet.")
+                    else:
+                        repeat_view = repeat_profile.rename(
+                            columns={
+                                "product_name": "Product",
+                                "purchase_days": "Purchase Days",
+                                "repeat_cycles": "Repeat Cycles",
+                                "avg_repeat_days": "Avg Repeat Days",
+                                "last_bought": "Last Bought",
+                                "days_since_last_purchase": "Days Since Last Purchase",
+                                "reorder_signal": "Signal",
+                            }
+                        )
+                        st.dataframe(repeat_view.head(int(recommendation_limit)), use_container_width=True, hide_index=True)
+
+                with bottom_right:
+                    st.markdown("**Personalization Suggestions**")
+                    if recommendations.empty:
+                        st.info("No repeat-driven suggestions available yet for this customer.")
+                    else:
+                        recommendation_view = recommendations.rename(
+                            columns={
+                                "product_name": "Product",
+                                "purchase_days": "Purchase Days",
+                                "avg_repeat_days": "Avg Repeat Days",
+                                "days_since_last_purchase": "Days Since Last Purchase",
+                                "gap_vs_average": "Gap vs Average",
+                                "reorder_signal": "Signal",
+                            }
+                        )
+                        st.dataframe(
+                            recommendation_view[
+                                [
+                                    "Product",
+                                    "Purchase Days",
+                                    "Avg Repeat Days",
+                                    "Days Since Last Purchase",
+                                    "Gap vs Average",
+                                    "Signal",
+                                ]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+if selected_page == "Churn Dashboard":
+    churn_item_source = load_persona_item_data(selected_branch, selected_type)
+    churn_limit_col, churn_rule_col = st.columns([0.7, 0.7])
+    with churn_limit_col:
+        churn_list_limit = st.number_input(
+            "Customers to show",
+            min_value=5,
+            max_value=100,
+            value=25,
+            step=5,
+            key="churn_list_limit",
+        )
+    with churn_rule_col:
+        churn_threshold_days = st.number_input(
+            "Churn threshold (days)",
+            min_value=30,
+            max_value=180,
+            value=60,
+            step=5,
+            key="churn_threshold_days",
+        )
+
+    churn_profile = build_customer_churn_profile(
+        branch_filtered_df,
+        churn_item_source,
+        reference_date=end_date,
+        churn_days=int(churn_threshold_days),
+    )
+
+    st.subheader("Churn Dashboard")
+    st.caption(
+        f"Customers with more than {int(churn_threshold_days)} days since last purchase are marked as churned. "
+        "Status is evaluated as of the selected end date."
+    )
+    render_churn_definitions(int(churn_threshold_days))
+
+    if churn_profile.empty:
+        st.info("No non-walkin customer history found for the selected branch/type filters.")
+    else:
+        churn_cards = build_churn_summary_cards(churn_profile)
+        card_cols = st.columns(5)
+        for column, (label, value) in zip(card_cols, churn_cards.items()):
+            if isinstance(value, float):
+                column.metric(label, f"{value:,.2f}")
+            else:
+                column.metric(label, f"{value:,}")
+
+        status_mix = build_churn_status_mix(churn_profile)
+        segment_summary = build_churn_segment_summary(churn_profile)
+        monthly_trend = build_monthly_churn_trend(churn_profile)
+        action_list = build_churn_action_list(churn_profile, int(churn_list_limit))
+        reason_summary, churned_detail, category_risk, churn_reason_metrics = build_churn_reason_analysis(churn_profile)
+
+        top_left, top_mid, top_right = st.columns([0.9, 1.2, 1.5])
+
+        with top_left:
+            st.markdown("**Status Mix**")
+            status_chart = px.pie(status_mix, names="status", values="customers")
+            st.plotly_chart(status_chart, use_container_width=True)
+
+        with top_mid:
+            st.markdown("**Monthly Status Trend**")
+            if monthly_trend.empty:
+                st.info("No monthly trend found.")
+            else:
+                trend_chart = px.bar(
+                    monthly_trend,
+                    x="month_label",
+                    y="customers",
+                    color="status",
+                    barmode="group",
+                    color_discrete_map={"Active": "#69a83b", "At Risk": "#f59e0b", "Churned": "#c0392b"},
+                )
+                trend_chart.update_layout(xaxis_title=None, yaxis_title=None)
+                st.plotly_chart(trend_chart, use_container_width=True)
+
+        with top_right:
+            st.markdown("**Segment x Status Summary**")
+            if segment_summary.empty:
+                st.info("No segment summary found.")
+            else:
+                segment_view = segment_summary.rename(
+                    columns={
+                        "customer_segment": "Customer Segment",
+                        "status": "Status",
+                        "customers": "Customers",
+                        "revenue": "Revenue",
+                    }
+                )
+                selection_event = st.dataframe(
+                    segment_view,
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="churn_segment_status_table",
+                )
+
+        selected_rows = selection_event.get("selection", {}).get("rows", []) if "selection_event" in locals() else []
+        if selected_rows:
+            selected_index = int(selected_rows[0])
+            selected_segment = str(segment_view.iloc[selected_index]["Customer Segment"])
+            selected_status = str(segment_view.iloc[selected_index]["Status"])
+            selected_customers = churn_profile[
+                (churn_profile["customer_segment"] == selected_segment)
+                & (churn_profile["status"] == selected_status)
+            ].copy()
+            selected_customers = selected_customers.rename(
+                columns={
+                    "phone": "Phone",
+                    "total_spend": "Total Value",
+                    "total_orders": "Total Orders",
+                    "days_since_last_purchase": "Days Since Last Purchase",
+                    "favorite_product": "Favorite Product",
+                    "favorite_category": "Favorite Category",
+                }
+            )
+            st.markdown(f"**Selected Details: {selected_segment} + {selected_status}**")
+            st.dataframe(
+                selected_customers[
+                    [
+                        "Phone",
+                        "Total Value",
+                        "Total Orders",
+                        "Days Since Last Purchase",
+                        "Favorite Product",
+                        "Favorite Category",
+                    ]
+                ].sort_values("Total Value", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("Select any row in `Segment x Status Summary` to view customer-level details.")
+
+        bottom_left, bottom_right = st.columns([1.6, 1.0])
+
+        with bottom_left:
+            st.markdown("**At-Risk / Churned Customer Action List**")
+            if action_list.empty:
+                st.info("No at-risk or churned customers found for the selected filters.")
+            else:
+                action_view = action_list.rename(
+                    columns={
+                        "phone": "Phone",
+                        "status": "Status",
+                        "days_since_last_purchase": "Days Since Last Purchase",
+                        "avg_reorder_days": "Avg Reorder Days",
+                        "days_over_repeat_gap": "Days Over Repeat Gap",
+                        "total_orders": "Total Orders",
+                        "total_spend": "Total Spend",
+                        "avg_order_value": "AOV",
+                        "favorite_category": "Favorite Category",
+                        "favorite_product": "Favorite Product",
+                        "repeat_anchor_product": "Repeat Product",
+                        "orders_last_30": "Orders L30",
+                        "orders_last_60": "Orders L60",
+                        "orders_last_90": "Orders L90",
+                        "priority_score": "Priority Score",
+                        "action_hint": "Action Hint",
+                    }
+                )
+                st.dataframe(
+                    action_view[
+                        [
+                            "Phone",
+                            "Status",
+                            "Days Since Last Purchase",
+                            "Avg Reorder Days",
+                            "Days Over Repeat Gap",
+                            "Total Orders",
+                            "Total Spend",
+                            "AOV",
+                            "Favorite Category",
+                            "Favorite Product",
+                            "Repeat Product",
+                            "Orders L30",
+                            "Orders L60",
+                            "Orders L90",
+                            "Priority Score",
+                            "Action Hint",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with bottom_right:
+            st.markdown("**Improvement Ideas**")
+            active_count = int((churn_profile["status"] == "Active").sum())
+            at_risk_count = int((churn_profile["status"] == "At Risk").sum())
+            churned_count = int((churn_profile["status"] == "Churned").sum())
+            avg_gap = float(churn_profile["avg_reorder_days"].dropna().mean()) if churn_profile["avg_reorder_days"].notna().any() else 0.0
+            top_category = (
+                churn_profile["favorite_category"].dropna().mode().iat[0]
+                if churn_profile["favorite_category"].dropna().any()
+                else "core staples"
+            )
+            st.metric("Average Reorder Gap", f"{avg_gap:,.1f} days")
+            st.metric("At-Risk Customers", f"{at_risk_count:,}")
+            st.metric("Churned Customers", f"{churned_count:,}")
+            st.metric("Active Customers", f"{active_count:,}")
+            st.markdown(
+                "\n".join(
+                    [
+                        f"- Send reminder campaigns before day {max(int(churn_threshold_days) - 10, 1)}.",
+                        f"- Build win-back offers around `{top_category}` because it is the strongest repeat affinity.",
+                        "- Prioritize customers with high spend and zero orders in the last 30 days.",
+                        "- Use the `Action Hint` field to decide whether to remind, win-back, or upsell.",
+                    ]
+                )
+            )
+
+        st.markdown("**Churn Reason Analysis**")
+        if reason_summary.empty:
+            st.info("No churned customers found for reason analysis.")
+        else:
+            reason_card_cols = st.columns(4)
+            reason_card_cols[0].metric("Churned Customers", f"{int(churn_reason_metrics['churned_customers']):,}")
+            reason_card_cols[1].metric("One-Time Buyer %", f"{churn_reason_metrics['one_time_pct']:.2f}%")
+            reason_card_cols[2].metric("No Orders L90 %", f"{churn_reason_metrics['no_orders_l90_pct']:.2f}%")
+            reason_card_cols[3].metric("Cycle Break %", f"{churn_reason_metrics['cycle_break_pct']:.2f}%")
+            st.caption(
+                "`Cycle Break %` means churned customers where `Days Since Last Purchase` is greater than "
+                "`1.5 x Avg Reorder Days` (customers with a valid reorder cycle only)."
+            )
+            cycle_break_click_col, _ = st.columns([0.45, 0.55])
+            with cycle_break_click_col:
+                show_cycle_break_only = st.button(
+                    "Show Cycle Break Customers",
+                    key="show_cycle_break_customers",
+                    use_container_width=True,
+                )
+
+            reason_left, reason_right = st.columns([1.3, 1.0])
+            with reason_left:
+                reason_chart = px.bar(
+                    reason_summary.sort_values("customers"),
+                    x="customers",
+                    y="primary_churn_reason",
+                    orientation="h",
+                    color="customers",
+                    color_continuous_scale="OrRd",
+                )
+                reason_chart.update_layout(xaxis_title="Customers", yaxis_title=None, coloraxis_showscale=False)
+                st.plotly_chart(reason_chart, use_container_width=True)
+
+            with reason_right:
+                st.markdown("**High Churn Categories**")
+                if category_risk.empty:
+                    st.info("No category-wise churn pattern found.")
+                else:
+                    st.dataframe(
+                        category_risk.rename(
+                            columns={
+                                "favorite_category": "Category",
+                                "churned_customers": "Churned Customers",
+                                "churned_revenue": "Churned Revenue",
+                            }
+                        ).head(12),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            reason_select_view = reason_summary.rename(
+                columns={
+                    "primary_churn_reason": "Primary Churn Reason",
+                    "customers": "Customers",
+                    "revenue_lost": "Revenue Lost",
+                    "avg_days_since_last": "Avg Days Since Last",
+                }
+            )
+            st.markdown("**Reason Summary (Click Any Row For Customer Details)**")
+            reason_selection = st.dataframe(
+                reason_select_view,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="churn_reason_summary_table",
+            )
+
+            selected_reason = None
+            if show_cycle_break_only:
+                selected_reason = "Missed expected reorder cycle"
+            selected_reason_rows = reason_selection.get("selection", {}).get("rows", [])
+            if selected_reason_rows:
+                selected_reason = str(reason_select_view.iloc[int(selected_reason_rows[0])]["Primary Churn Reason"])
+
+            st.markdown("**Churned Customer Reason Details**")
+            churn_reason_view = churned_detail.rename(
+                columns={
+                    "phone": "Phone",
+                    "primary_churn_reason": "Primary Churn Reason",
+                    "days_since_last_purchase": "Days Since Last Purchase",
+                    "avg_reorder_days": "Avg Reorder Days",
+                    "total_orders": "Total Orders",
+                    "total_spend": "Total Value",
+                    "orders_last_90": "Orders L90",
+                    "favorite_category": "Favorite Category",
+                    "favorite_product": "Favorite Product",
+                    "action_hint": "Action Hint",
+                }
+            )
+            reason_filtered_view = churn_reason_view.copy()
+            if selected_reason:
+                reason_filtered_view = reason_filtered_view[
+                    reason_filtered_view["Primary Churn Reason"] == selected_reason
+                ].copy()
+                st.caption(f"Showing details for: `{selected_reason}`")
+            else:
+                st.caption("Tip: click a row in `Reason Summary` to see matching customer details only.")
+            reason_detail_columns = [
+                "Phone",
+                "Primary Churn Reason",
+                "Days Since Last Purchase",
+                "Avg Reorder Days",
+                "Total Orders",
+                "Total Value",
+                "Orders L90",
+                "Favorite Category",
+                "Favorite Product",
+                "Action Hint",
+            ]
+            reason_detail_display = reason_filtered_view[reason_detail_columns].sort_values(
+                ["Days Since Last Purchase", "Total Value"],
+                ascending=[False, False],
+            )
+            if not selected_reason:
+                reason_detail_display = reason_detail_display.head(int(churn_list_limit))
+            st.dataframe(
+                reason_detail_display,
+                use_container_width=True,
+                hide_index=True,
+            )
 
 if selected_page == "Customer Count Branch Wise":
     branch_source = branch_filtered_df.copy()

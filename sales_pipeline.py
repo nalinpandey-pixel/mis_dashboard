@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time as time_module
@@ -138,29 +139,92 @@ def parse_args() -> argparse.Namespace:
         "--removed-output",
         help="Optional path to export removed rows as Excel.",
     )
+    parser.add_argument(
+        "--target-sync-from-local",
+        action="store_true",
+        help="Push full local SQLite tables to target Supabase backup tables.",
+    )
+    parser.add_argument(
+        "--truncate-target-first",
+        action="store_true",
+        help="Delete existing rows from target backup tables before upload.",
+    )
+    parser.add_argument(
+        "--target-cleaned-table",
+        default="sales_cleaned_local_backup",
+        help="Target Supabase table for local cleaned rows backup.",
+    )
+    parser.add_argument(
+        "--target-removed-table",
+        default="sales_removed_local_backup",
+        help="Target Supabase table for local removed rows backup.",
+    )
+    parser.add_argument(
+        "--target-sales-raw-table",
+        default="sales_raw_backup",
+        help="Target Supabase table for local sales_raw backup.",
+    )
+    parser.add_argument(
+        "--target-history-table",
+        default="sales_items_history_backup",
+        help="Target Supabase table for local sales_items_history backup.",
+    )
+    parser.add_argument(
+        "--write-target-backup-ddl",
+        help="Optional path to write SQL DDL for creating target backup tables.",
+    )
+    parser.add_argument(
+        "--skip-target-truncate",
+        action="store_true",
+        help="Skip target table deletes and only upsert/insert into backup tables.",
+    )
     return parser.parse_args()
 
 
-def load_supabase_config() -> SupabaseConfig:
+def load_secrets_map() -> Dict[str, Any]:
     load_dotenv(BASE_DIR / ".env")
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+    secrets: Dict[str, Any] = dict(os.environ)
+    for candidate in (
+        BASE_DIR / ".streamlit" / "secrets.toml",
+        Path.home() / ".streamlit" / "secrets.toml",
+    ):
+        if not candidate.exists():
+            continue
+        with candidate.open("rb") as handle:
+            loaded = tomllib.load(handle)
+        secrets.update({key: value for key, value in loaded.items() if key not in secrets})
+    return secrets
+
+
+def load_named_supabase_config(url_keys: List[str], key_keys: List[str], label: str) -> SupabaseConfig:
+    secrets = load_secrets_map()
+    url = next((str(secrets[key]) for key in url_keys if secrets.get(key)), None)
+    key = next((str(secrets[key]) for key in key_keys if secrets.get(key)), None)
     if not url or not key:
-        for candidate in (
-            BASE_DIR / ".streamlit" / "secrets.toml",
-            Path.home() / ".streamlit" / "secrets.toml",
-        ):
-            if not candidate.exists():
-                continue
-            with candidate.open("rb") as handle:
-                secrets = tomllib.load(handle)
-            url = url or secrets.get("SUPABASE_URL")
-            key = key or secrets.get("SUPABASE_SERVICE_ROLE_KEY") or secrets.get("SUPABASE_KEY")
-            if url and key:
-                break
-    if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE key in .env or Streamlit secrets.")
+        raise RuntimeError(
+            "Missing {0} Supabase config. Checked URL keys {1} and key names {2}.".format(
+                label,
+                ", ".join(url_keys),
+                ", ".join(key_keys),
+            )
+        )
     return SupabaseConfig(url=url.rstrip("/"), key=key)
+
+
+def load_source_supabase_config() -> SupabaseConfig:
+    return load_named_supabase_config(
+        ["SOURCE_SUPABASE_URL", "SUPABASE_SOURCE_URL", "SUPABASE_URL"],
+        ["SOURCE_SUPABASE_SERVICE_ROLE_KEY", "SOURCE_SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY"],
+        "source",
+    )
+
+
+def load_target_supabase_config() -> SupabaseConfig:
+    return load_named_supabase_config(
+        ["TARGET_SUPABASE_URL", "SUPABASE_URL"],
+        ["TARGET_SUPABASE_SERVICE_ROLE_KEY", "TARGET_SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY"],
+        "target",
+    )
 
 
 def parse_utc_timestamp(value: str) -> pd.Timestamp:
@@ -816,6 +880,94 @@ def rebuild_joined_history_table(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_{0}_cleaned_sales_no ON {0} (cleaned_sales_no)".format(JOINED_HISTORY_TABLE)
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_{0}_sales_date ON {0} (sales_date)".format(JOINED_HISTORY_TABLE)
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_{0}_product_name ON {0} (product_name)".format(JOINED_HISTORY_TABLE)
+    )
+
+
+def refresh_joined_history_rows(connection: sqlite3.Connection, raw_df: pd.DataFrame, full_refresh: bool) -> None:
+    if full_refresh:
+        rebuild_joined_history_table(connection)
+        return
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS {joined_table} AS
+        SELECT
+            h.*,
+            r.sales_no AS cleaned_sales_no,
+            r.mob_no AS cleaned_mob_no,
+            r.sales_date AS cleaned_sales_date,
+            r.branch_code AS cleaned_branch_code,
+            r.order_type AS cleaned_order_type,
+            r.net_amount AS cleaned_net_amount
+        FROM {raw_table} h
+        LEFT JOIN {historical_table} r
+            ON h.sales_no = r.sales_no
+        WHERE 1 = 0
+        """.format(
+            joined_table=JOINED_HISTORY_TABLE,
+            raw_table=RAW_HISTORY_TABLE,
+            historical_table=HISTORICAL_TABLE,
+        )
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_{0}_sales_no ON {0} (sales_no)".format(JOINED_HISTORY_TABLE)
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_{0}_cleaned_sales_no ON {0} (cleaned_sales_no)".format(JOINED_HISTORY_TABLE)
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_{0}_sales_date ON {0} (sales_date)".format(JOINED_HISTORY_TABLE)
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_{0}_product_name ON {0} (product_name)".format(JOINED_HISTORY_TABLE)
+    )
+
+    if raw_df.empty or "sales_no" not in raw_df.columns:
+        return
+
+    sales_nos = sorted(
+        {
+            str(value).strip()
+            for value in raw_df["sales_no"].dropna().tolist()
+            if str(value).strip() not in {"", "None", "nan", "NaN"}
+        }
+    )
+    if not sales_nos:
+        return
+
+    placeholders = ", ".join("?" for _ in sales_nos)
+    connection.execute(
+        "DELETE FROM {0} WHERE sales_no IN ({1})".format(JOINED_HISTORY_TABLE, placeholders),
+        sales_nos,
+    )
+    connection.execute(
+        """
+        INSERT INTO {joined_table}
+        SELECT
+            h.*,
+            r.sales_no AS cleaned_sales_no,
+            r.mob_no AS cleaned_mob_no,
+            r.sales_date AS cleaned_sales_date,
+            r.branch_code AS cleaned_branch_code,
+            r.order_type AS cleaned_order_type,
+            r.net_amount AS cleaned_net_amount
+        FROM {raw_table} h
+        LEFT JOIN {historical_table} r
+            ON h.sales_no = r.sales_no
+        WHERE h.sales_no IN ({placeholders})
+        """.format(
+            joined_table=JOINED_HISTORY_TABLE,
+            raw_table=RAW_HISTORY_TABLE,
+            historical_table=HISTORICAL_TABLE,
+            placeholders=placeholders,
+        ),
+        sales_nos,
+    )
 
 
 def prepare_raw_history_rows(raw_df: pd.DataFrame) -> Tuple[List[str], List[Tuple[Any, ...]]]:
@@ -967,7 +1119,7 @@ def persist_to_local_db(
 
         append_to_historical_table(connection, cleaned_df)
         persist_raw_history(connection, raw_df)
-        rebuild_joined_history_table(connection)
+        refresh_joined_history_rows(connection, raw_df, full_refresh)
 
         removed_payload = prepare_sqlite_removed_rows(removed_rows)
         if removed_payload:
@@ -983,6 +1135,471 @@ def persist_to_local_db(
         connection.commit()
     finally:
         connection.close()
+
+
+def supabase_headers(config: SupabaseConfig, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = {
+        "apikey": config.key,
+        "Authorization": "Bearer {0}".format(config.key),
+        "Content-Type": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def delete_remote_rows(
+    config: SupabaseConfig,
+    table_name: str,
+    params: Optional[Dict[str, str]] = None,
+) -> None:
+    session = requests.Session()
+    session.trust_env = False
+    response = session.delete(
+        "{0}/rest/v1/{1}".format(config.url, table_name),
+        headers=supabase_headers(config, {"Prefer": "return=minimal"}),
+        params=params or {},
+        timeout=120,
+    )
+    response.raise_for_status()
+
+
+def post_remote_rows(
+    config: SupabaseConfig,
+    table_name: str,
+    rows: List[Dict[str, Any]],
+    *,
+    upsert: bool = False,
+    on_conflict: Optional[str] = None,
+) -> None:
+    if not rows:
+        return
+
+    headers = supabase_headers(
+        config,
+        {
+            "Prefer": "resolution=merge-duplicates,return=minimal" if upsert else "return=minimal",
+        },
+    )
+    params: Dict[str, str] = {}
+    if on_conflict:
+        params["on_conflict"] = on_conflict
+
+    session = requests.Session()
+    session.trust_env = False
+    for index in range(0, len(rows), FETCH_PAGE_SIZE):
+        chunk = rows[index : index + FETCH_PAGE_SIZE]
+        response = session.post(
+            "{0}/rest/v1/{1}".format(config.url, table_name),
+            headers=headers,
+            params=params,
+            json=chunk,
+            timeout=180,
+        )
+        response.raise_for_status()
+
+
+def utc_to_sales_raw_text(value: str) -> str:
+    return (
+        parse_utc_timestamp(value)
+        .tz_convert(LOCAL_TIMEZONE)
+        .tz_localize(None)
+        .strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+
+def prepare_remote_cleaned_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for record_id, sales_date, sales_date_utc, order_id, phone, amount, branch_code, order_type, source_table, synced_at in prepare_sqlite_cleaned_rows(df):
+        rows.append(
+            {
+                "record_id": record_id,
+                "sales_date": sales_date,
+                "sales_date_utc": sales_date_utc,
+                "order_id": order_id,
+                "phone": phone,
+                "amount": amount,
+                "branch_code": branch_code,
+                "order_type": order_type,
+                "source_table": source_table,
+                "synced_at": synced_at,
+            }
+        )
+    return rows
+
+
+def prepare_remote_removed_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for removed_id, sales_date_utc, order_id, phone, amount, removal_reason, source_table, logged_at, raw_payload in prepare_sqlite_removed_rows(df):
+        rows.append(
+            {
+                "removed_id": removed_id,
+                "sales_date_utc": sales_date_utc,
+                "order_id": order_id,
+                "phone": phone,
+                "amount": amount,
+                "removal_reason": removal_reason,
+                "source_table": source_table,
+                "logged_at": logged_at,
+                "raw_payload": json.loads(raw_payload),
+            }
+        )
+    return rows
+
+
+def fetch_remote_max_sales_raw_id(config: SupabaseConfig) -> int:
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(
+        "{0}/rest/v1/{1}".format(config.url, HISTORICAL_TABLE),
+        headers=supabase_headers(config),
+        params={"select": "id", "order": "id.desc", "limit": 1},
+        timeout=30,
+    )
+    response.raise_for_status()
+    rows = response.json() or []
+    if not rows or rows[0].get("id") is None:
+        return 0
+    return int(rows[0]["id"])
+
+
+def prepare_remote_sales_raw_rows(df: pd.DataFrame, starting_id: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    next_id = starting_id
+    for sales_no, mob_no, sales_date, branch_code, order_type, net_amount in prepare_sales_raw_rows(df):
+        next_id += 1
+        rows.append(
+            {
+                "id": next_id,
+                "sales_no": sales_no,
+                "mob_no": mob_no,
+                "sales_date": sales_date,
+                "branch_code": branch_code,
+                "order_type": order_type,
+                "net_amount": net_amount,
+            }
+        )
+    return rows
+
+
+def prepare_remote_historical_seed_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df.empty:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        rows.append(
+            {
+                "id": int(row["id"]) if pd.notna(row.get("id")) else None,
+                "sales_date": row["sales_date"],
+                "sales_no": row["sales_no"] or None,
+                "mob_no": row["mob_no"] or None,
+                "net_amount": float(row["net_amount"]) if pd.notna(row.get("net_amount")) else None,
+                "branch_code": row.get("branch_code") or None,
+                "order_type": row.get("order_type") or None,
+            }
+        )
+    return rows
+
+
+def prepare_remote_raw_history_rows(raw_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    column_order, rows = prepare_raw_history_rows(raw_df)
+    if not rows:
+        return []
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        record = dict(zip(column_order, row))
+        for key, value in list(record.items()):
+            if isinstance(value, bool):
+                record[key] = int(value)
+        normalized_rows.append(record)
+    return normalized_rows
+
+
+def load_local_table_as_records(db_path: Path, table_name: str) -> List[Dict[str, Any]]:
+    connection = sqlite3.connect(str(db_path))
+    try:
+        frame = pd.read_sql_query("SELECT * FROM {0}".format(table_name), connection)
+    finally:
+        connection.close()
+    if frame.empty:
+        return []
+    frame = frame.where(pd.notna(frame), None)
+    integer_columns_by_table = {
+        HISTORICAL_TABLE: {"id"},
+        RAW_HISTORY_TABLE: {"id", "branch_id"},
+    }
+    boolean_columns_by_table = {
+        RAW_HISTORY_TABLE: {"tax_included", "is_excluded", "lmd_pushed"},
+    }
+    integer_columns = integer_columns_by_table.get(table_name, set())
+    boolean_columns = boolean_columns_by_table.get(table_name, set())
+    records: List[Dict[str, Any]] = []
+    for row in frame.to_dict("records"):
+        normalized: Dict[str, Any] = {}
+        for key, value in row.items():
+            if isinstance(value, pd.Timestamp):
+                normalized[key] = value.isoformat()
+            elif isinstance(value, float):
+                if not math.isfinite(value):
+                    normalized[key] = None
+                elif key in integer_columns:
+                    normalized[key] = int(value)
+                elif key in boolean_columns:
+                    normalized[key] = bool(int(value))
+                else:
+                    normalized[key] = value
+            elif isinstance(value, bool):
+                normalized[key] = value if key in boolean_columns else int(value)
+            elif key in integer_columns and value is not None:
+                text = str(value).strip()
+                if text == "":
+                    normalized[key] = None
+                else:
+                    normalized[key] = int(float(text))
+            elif key in boolean_columns and value is not None:
+                text = str(value).strip().lower()
+                if text in {"true", "t", "1"}:
+                    normalized[key] = True
+                elif text in {"false", "f", "0"}:
+                    normalized[key] = False
+                else:
+                    normalized[key] = None
+            else:
+                normalized[key] = value
+        records.append(normalized)
+    return records
+
+
+def build_target_backup_ddl(args: argparse.Namespace) -> str:
+    cleaned_table = args.target_cleaned_table
+    removed_table = args.target_removed_table
+    sales_raw_table = args.target_sales_raw_table
+    history_table = args.target_history_table
+    return """
+CREATE TABLE IF NOT EXISTS public.{cleaned_table} (
+    record_id text PRIMARY KEY,
+    sales_date date NOT NULL,
+    sales_date_utc timestamptz NOT NULL,
+    order_id text,
+    phone text,
+    amount numeric(18, 2) NOT NULL,
+    branch_code text,
+    order_type text,
+    source_table text NOT NULL,
+    synced_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_{cleaned_table}_sales_date ON public.{cleaned_table} (sales_date);
+CREATE INDEX IF NOT EXISTS idx_{cleaned_table}_sales_date_utc ON public.{cleaned_table} (sales_date_utc);
+CREATE INDEX IF NOT EXISTS idx_{cleaned_table}_phone ON public.{cleaned_table} (phone);
+
+CREATE TABLE IF NOT EXISTS public.{removed_table} (
+    removed_id text PRIMARY KEY,
+    sales_date_utc timestamptz,
+    order_id text,
+    phone text,
+    amount numeric(18, 2),
+    removal_reason text NOT NULL,
+    source_table text NOT NULL,
+    logged_at timestamptz NOT NULL,
+    raw_payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_{removed_table}_sales_date_utc ON public.{removed_table} (sales_date_utc);
+CREATE INDEX IF NOT EXISTS idx_{removed_table}_phone ON public.{removed_table} (phone);
+
+CREATE TABLE IF NOT EXISTS public.{sales_raw_table} (
+    id bigint,
+    sales_date timestamptz,
+    sales_no text,
+    mob_no text,
+    net_amount numeric(18, 2),
+    branch_code text,
+    order_type text
+);
+CREATE INDEX IF NOT EXISTS idx_{sales_raw_table}_sales_date ON public.{sales_raw_table} (sales_date);
+CREATE INDEX IF NOT EXISTS idx_{sales_raw_table}_sales_no ON public.{sales_raw_table} (sales_no);
+CREATE INDEX IF NOT EXISTS idx_{sales_raw_table}_mob_no ON public.{sales_raw_table} (mob_no);
+
+CREATE TABLE IF NOT EXISTS public.{history_table} (
+    _row_hash text PRIMARY KEY,
+    _synced_at timestamptz NOT NULL,
+    _source_table text NOT NULL,
+    id bigint,
+    sales_no text,
+    item_code text,
+    batch_no text,
+    branch_id bigint,
+    branch_name text,
+    sales_date timestamptz,
+    type text,
+    order_type text,
+    receipt_data text,
+    total numeric(18, 3),
+    mrp_amount numeric(18, 3),
+    tcs_amount numeric(18, 3),
+    tax_included boolean,
+    customer_name text,
+    mob_no text,
+    billing_gst_in text,
+    address text,
+    product_name text,
+    product_type text,
+    hsn_code text,
+    measurement_code text,
+    category_name text,
+    sub_category_name text,
+    brand_name text,
+    sub_brand_name text,
+    department_name text,
+    product_description text,
+    mrp numeric(18, 3),
+    tax_exclusive_mrp numeric(18, 3),
+    price numeric(18, 3),
+    selling_price numeric(18, 3),
+    purchase_price numeric(18, 3),
+    landing_cost numeric(18, 3),
+    qty numeric(18, 3),
+    discount numeric(18, 3),
+    total_discount numeric(18, 3),
+    flat_discount numeric(18, 3),
+    bill_discount numeric(18, 3),
+    item_flat_discount numeric(18, 3),
+    item_bill_discount numeric(18, 3),
+    other_discount numeric(18, 3),
+    flat_discount_type text,
+    bill_discount_type text,
+    tax_rate numeric(18, 3),
+    tax_amount numeric(18, 3),
+    cgst numeric(18, 3),
+    igst numeric(18, 3),
+    cess_rate numeric(18, 3),
+    cess_amount numeric(18, 3),
+    basic_value numeric(18, 3),
+    net_amount numeric(18, 3),
+    profit numeric(18, 3),
+    employee_name text,
+    created_by text,
+    sale_day date,
+    customer_type text,
+    is_excluded boolean,
+    exclusion_reason text,
+    excluded_at timestamptz,
+    excluded_by text,
+    ingested_at timestamptz,
+    updated_at timestamptz,
+    lmd_pushed boolean,
+    lmd_pushed_at timestamptz,
+    lmd_skip_reason text,
+    order_status text
+);
+CREATE INDEX IF NOT EXISTS idx_{history_table}_sales_date ON public.{history_table} (sales_date);
+CREATE INDEX IF NOT EXISTS idx_{history_table}_sales_no ON public.{history_table} (sales_no);
+CREATE INDEX IF NOT EXISTS idx_{history_table}_mob_no ON public.{history_table} (mob_no);
+CREATE INDEX IF NOT EXISTS idx_{history_table}_product_name ON public.{history_table} (product_name);
+""".strip().format(
+        cleaned_table=cleaned_table,
+        removed_table=removed_table,
+        sales_raw_table=sales_raw_table,
+        history_table=history_table,
+    )
+
+
+def sync_local_backup_to_target_supabase(args: argparse.Namespace, db_path: Path) -> int:
+    if not db_path.exists():
+        raise FileNotFoundError("Local SQLite DB not found: {0}".format(db_path))
+
+    target_config = load_target_supabase_config()
+
+    cleaned_rows = load_local_table_as_records(db_path, LOCAL_CLEANED_TABLE)
+    removed_rows = load_local_table_as_records(db_path, LOCAL_REMOVED_TABLE)
+    sales_raw_rows = load_local_table_as_records(db_path, HISTORICAL_TABLE)
+    history_rows = load_local_table_as_records(db_path, RAW_HISTORY_TABLE)
+
+    print("Preparing local backup sync to target Supabase")
+    print("Local table {0}: {1:,} rows".format(LOCAL_CLEANED_TABLE, len(cleaned_rows)))
+    print("Local table {0}: {1:,} rows".format(LOCAL_REMOVED_TABLE, len(removed_rows)))
+    print("Local table {0}: {1:,} rows".format(HISTORICAL_TABLE, len(sales_raw_rows)))
+    print("Local table {0}: {1:,} rows".format(RAW_HISTORY_TABLE, len(history_rows)))
+
+    if args.truncate_target_first and not args.skip_target_truncate:
+        delete_remote_rows(target_config, args.target_cleaned_table, {"record_id": "not.is.null"})
+        delete_remote_rows(target_config, args.target_removed_table, {"removed_id": "not.is.null"})
+        delete_remote_rows(target_config, args.target_sales_raw_table, {"id": "gt.0"})
+        delete_remote_rows(target_config, args.target_history_table, {"_row_hash": "not.is.null"})
+        print("Target backup tables truncated before upload.")
+    elif args.truncate_target_first and args.skip_target_truncate:
+        print("Skipping target truncate due to --skip-target-truncate.")
+
+    post_remote_rows(
+        target_config,
+        args.target_cleaned_table,
+        cleaned_rows,
+        upsert=True,
+        on_conflict="record_id",
+    )
+    post_remote_rows(
+        target_config,
+        args.target_removed_table,
+        removed_rows,
+        upsert=True,
+        on_conflict="removed_id",
+    )
+    post_remote_rows(
+        target_config,
+        args.target_sales_raw_table,
+        sales_raw_rows,
+        upsert=False,
+    )
+    post_remote_rows(
+        target_config,
+        args.target_history_table,
+        history_rows,
+        upsert=True,
+        on_conflict="_row_hash",
+    )
+
+    print("Target backup sync complete.")
+    print("Uploaded to:")
+    print("- {0}".format(args.target_cleaned_table))
+    print("- {0}".format(args.target_removed_table))
+    print("- {0}".format(args.target_sales_raw_table))
+    print("- {0}".format(args.target_history_table))
+    return 0
+
+
+def persist_to_target_supabase(
+    config: SupabaseConfig,
+    raw_df: pd.DataFrame,
+    cleaned_df: pd.DataFrame,
+    removed_rows: pd.DataFrame,
+    full_refresh: bool,
+    delete_window_utc: Optional[Tuple[str, Optional[str]]] = None,
+    historical_seed_df: Optional[pd.DataFrame] = None,
+) -> None:
+    if full_refresh:
+        delete_remote_rows(config, LOCAL_CLEANED_TABLE, {"record_id": "not.is.null"})
+        delete_remote_rows(config, LOCAL_REMOVED_TABLE, {"removed_id": "not.is.null"})
+        delete_remote_rows(config, HISTORICAL_TABLE, {"id": "gt.0"})
+        delete_remote_rows(config, RAW_HISTORY_TABLE, {"_row_hash": "not.is.null"})
+    elif delete_window_utc:
+        start_utc = delete_window_utc[0]
+        delete_remote_rows(config, LOCAL_CLEANED_TABLE, {"sales_date_utc": "gte.{0}".format(start_utc)})
+        delete_remote_rows(config, LOCAL_REMOVED_TABLE, {"sales_date_utc": "gte.{0}".format(start_utc)})
+        delete_remote_rows(config, HISTORICAL_TABLE, {"sales_date": "gte.{0}".format(utc_to_sales_raw_text(start_utc))})
+        delete_remote_rows(config, RAW_HISTORY_TABLE, {"sales_date": "gte.{0}".format(start_utc)})
+
+    cleaned_payload = prepare_remote_cleaned_rows(cleaned_df)
+    removed_payload = prepare_remote_removed_rows(removed_rows)
+    starting_id = 0 if full_refresh else fetch_remote_max_sales_raw_id(config)
+    sales_raw_payload = prepare_remote_sales_raw_rows(cleaned_df, starting_id)
+    raw_history_payload = prepare_remote_raw_history_rows(raw_df)
+    historical_seed_payload = prepare_remote_historical_seed_rows(historical_seed_df) if historical_seed_df is not None else []
+
+    post_remote_rows(config, LOCAL_CLEANED_TABLE, cleaned_payload, upsert=True, on_conflict="record_id")
+    post_remote_rows(config, LOCAL_REMOVED_TABLE, removed_payload, upsert=True, on_conflict="removed_id")
+    if full_refresh and historical_seed_payload:
+        post_remote_rows(config, HISTORICAL_TABLE, historical_seed_payload, upsert=False)
+    post_remote_rows(config, HISTORICAL_TABLE, sales_raw_payload, upsert=False)
+    post_remote_rows(config, RAW_HISTORY_TABLE, raw_history_payload, upsert=True, on_conflict="_row_hash")
 
 
 def load_cleaned_sales_data(
@@ -1022,12 +1639,25 @@ def run_sync(args: argparse.Namespace) -> int:
     db_path = Path(args.db_file).expanduser().resolve()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    config = load_supabase_config()
+
+    if args.write_target_backup_ddl:
+        ddl = build_target_backup_ddl(args)
+        ddl_path = Path(args.write_target_backup_ddl).expanduser().resolve()
+        ddl_path.parent.mkdir(parents=True, exist_ok=True)
+        ddl_path.write_text(ddl + "\n", encoding="utf-8")
+        print("Wrote target backup DDL to {0}".format(ddl_path))
+        if not args.target_sync_from_local:
+            return 0
+
+    if args.target_sync_from_local:
+        return sync_local_backup_to_target_supabase(args, db_path)
+
+    source_config = load_source_supabase_config()
 
     if args.rebuild_yesterday:
         rebuild_start_utc, rebuild_end_utc = build_yesterday_window_utc()
         raw_df, cleaned_df, removed_rows, summary = load_rebuild_window_data(
-            config=config,
+            config=source_config,
             start_utc=rebuild_start_utc,
             end_utc=rebuild_end_utc,
         )
@@ -1062,7 +1692,7 @@ def run_sync(args: argparse.Namespace) -> int:
         return 0
 
     raw_df, cleaned_df, removed_rows, summary, fetch_start_utc = load_cleaned_sales_data(
-        config=config,
+        config=source_config,
         state_path=state_path,
         start_utc=args.start_utc,
         raw_history_start_utc=args.raw_history_start_utc,
@@ -1086,6 +1716,7 @@ def run_sync(args: argparse.Namespace) -> int:
             write_state(state_path, summary.source_max_utc)
         return 0
 
+    historical_seed_df = load_historical_sales_seed() if args.full_refresh else None
     persist_to_local_db(
         db_path,
         raw_df,
@@ -1093,9 +1724,8 @@ def run_sync(args: argparse.Namespace) -> int:
         removed_rows,
         full_refresh=args.full_refresh,
         delete_window_utc=None if args.full_refresh else (fetch_start_utc, None),
-        historical_seed_df=load_historical_sales_seed() if args.full_refresh else None,
+        historical_seed_df=historical_seed_df,
     )
-
     if summary.source_max_utc:
         write_state(state_path, summary.source_max_utc)
         print("Updated state to {0}".format(summary.source_max_utc))
