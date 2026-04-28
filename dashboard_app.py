@@ -1,4 +1,4 @@
-import sqlite3
+﻿import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -181,7 +181,7 @@ def load_sales_data() -> pd.DataFrame:
     frame["bin_range"] = pd.cut(
         frame["amount"],
         bins=[-float("inf"), 200, 400, 600, float("inf")],
-        labels=["1-0–200", "2-201–400", "3-401–600", "4-600+"],
+        labels=["1-0â€“200", "2-201â€“400", "3-401â€“600", "4-600+"],
     ).astype(str)
 
     # Match Power BI DAX more closely:
@@ -1383,7 +1383,7 @@ def build_binrange_matrix(
     )
     desired_index = []
     for cohort in month_order["cohort_month1"].tolist():
-        for bin_name in ["1-0–200", "2-201–400", "3-401–600", "4-600+"]:
+        for bin_name in ["1-0â€“200", "2-201â€“400", "3-401â€“600", "4-600+"]:
             desired_index.append((cohort, bin_name))
     pivot = pivot.reindex(pd.MultiIndex.from_tuples(desired_index, names=["CohortMonth1", "BinRange"]))
     pivot = pivot.fillna(0)
@@ -1582,10 +1582,10 @@ def build_order_aov_distribution(frame: pd.DataFrame) -> pd.DataFrame:
         .tolist()
     )
     pivot = pivot.reindex(order).fillna(0)
-    for column in ["1-0–200", "2-201–400", "3-401–600", "4-600+"]:
+    for column in ["1-0â€“200", "2-201â€“400", "3-401â€“600", "4-600+"]:
         if column not in pivot.columns:
             pivot[column] = 0
-    pivot = pivot[["1-0–200", "2-201–400", "3-401–600", "4-600+"]]
+    pivot = pivot[["1-0â€“200", "2-201â€“400", "3-401â€“600", "4-600+"]]
     pivot["Total"] = pivot.sum(axis=1)
     total_row = pd.DataFrame([pivot.sum(axis=0)], index=["Total"])
     return pd.concat([pivot, total_row])
@@ -2083,7 +2083,7 @@ def render_tag_change_summary(summary_df: pd.DataFrame, current_label: str, prev
             f"{row[current_label]:,} vs {row[previous_label]:,}",
             delta_text,
         )
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
 
 
 def style_count_matrix(frame: pd.DataFrame):
@@ -2144,7 +2144,7 @@ st.caption("Live historical + latest cleaned sales from Supabase")
 
 refresh_col, rebuild_col, status_col = st.columns([0.18, 0.22, 0.60])
 with refresh_col:
-    if st.button("Refresh till now", use_container_width=True):
+    if st.button("Refresh till now", width="stretch"):
         with st.spinner("Refreshing latest data..."):
             refresh_args = ("--full-refresh",) if not local_db_has_sales_rows() else ()
             ok, message = run_pipeline_command(*refresh_args)
@@ -2157,7 +2157,7 @@ with refresh_col:
             st.code(message)
 
 with rebuild_col:
-    if st.button("Rebuild Yesterday", use_container_width=True):
+    if st.button("Rebuild Yesterday", width="stretch"):
         with st.spinner("Deleting and rebuilding yesterday data..."):
             ok, message = run_pipeline_command("--rebuild-yesterday")
         st.cache_data.clear()
@@ -2198,7 +2198,7 @@ for col, label in zip(
     ["Today", "Yesterday", "This Week", "This Month", "Last Month", "Last 3 Months"],
 ):
     with col:
-        if st.button(label, key="quick_" + label.replace(" ", "_"), use_container_width=True):
+        if st.button(label, key="quick_" + label.replace(" ", "_"), width="stretch"):
             start_date, end_date = apply_quick_range(label, today_value)
             st.session_state.filter_from = start_date
             st.session_state.filter_to = end_date
@@ -2211,7 +2211,7 @@ recent_months = (
     .head(12)
 )
 st.caption(
-    "Months: " + "  ·  ".join(recent_months["year_month_label"].tolist())
+    "Months: " + "  Â·  ".join(recent_months["year_month_label"].tolist())
 )
 
 filter_cols = st.columns([1.1, 1.2, 1.2, 1.3, 1.1])
@@ -2318,41 +2318,41 @@ if selected_page == "Summary":
 
     with top_left:
         st.subheader("MOM Summary")
-        st.dataframe(monthly_summary(filtered_df), use_container_width=True, hide_index=True)
+        st.dataframe(monthly_summary(filtered_df), width="stretch", hide_index=True)
 
     user_distribution, channel_distribution = current_month_distributions(branch_filtered_df)
 
     with top_mid:
         st.subheader("Current Month User Distribution")
         user_chart = px.pie(user_distribution, names="segment", values="count")
-        st.plotly_chart(user_chart, use_container_width=True)
+        st.plotly_chart(user_chart, width="stretch")
 
     with top_right:
         st.subheader("Current Online/Offline Revenue Distribution")
         channel_chart = px.pie(channel_distribution, names="channel", values="revenue")
-        st.plotly_chart(channel_chart, use_container_width=True)
+        st.plotly_chart(channel_chart, width="stretch")
 
     bottom_left, bottom_mid, bottom_right, bottom_far = st.columns(4)
 
     with bottom_left:
         st.subheader("Repeated Customer")
         repeated_table = segment_monthly_table(filtered_df, "repeated")
-        st.dataframe(repeated_table, use_container_width=True, hide_index=True)
+        st.dataframe(repeated_table, width="stretch", hide_index=True)
 
     with bottom_mid:
         st.subheader("New Customer")
         new_table = segment_monthly_table(filtered_df, "new")
-        st.dataframe(new_table, use_container_width=True, hide_index=True)
+        st.dataframe(new_table, width="stretch", hide_index=True)
 
     with bottom_right:
         st.subheader("Walkin Customer")
         walkin_table = segment_monthly_table(filtered_df, "walkin")
-        st.dataframe(walkin_table, use_container_width=True, hide_index=True)
+        st.dataframe(walkin_table, width="stretch", hide_index=True)
 
     with bottom_far:
         st.subheader("B2B Sales")
         b2b_table = segment_monthly_table(filtered_df, "b2b")
-        st.dataframe(b2b_table, use_container_width=True, hide_index=True)
+        st.dataframe(b2b_table, width="stretch", hide_index=True)
 
 if selected_page == "Repeated 30":
     cohort_source = branch_filtered_df.copy()
@@ -2367,28 +2367,28 @@ if selected_page == "Repeated 30":
         if mom_counts.empty:
             st.info("No cohort rows found for the selected branches.")
         else:
-            st.dataframe(style_count_matrix(mom_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(mom_counts), width="stretch")
 
     with top_right:
         st.subheader("L0-30 Repeat")
         if repeat_30_counts.empty:
             st.info("No 30-day repeat rows found for the selected branches.")
         else:
-            st.dataframe(style_count_matrix(repeat_30_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(repeat_30_counts), width="stretch")
 
     with bottom_left:
         st.subheader("MOM Repeat Cohort %")
         if mom_percentages.empty:
             st.info("No cohort percentage rows found for the selected branches.")
         else:
-            st.dataframe(style_percentage_matrix(mom_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(mom_percentages), width="stretch")
 
     with bottom_right:
         st.subheader("L0-30 Repeat %")
         if repeat_30_percentages.empty:
             st.info("No 30-day repeat percentage rows found for the selected branches.")
         else:
-            st.dataframe(style_percentage_matrix(repeat_30_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(repeat_30_percentages), width="stretch")
 
 if selected_page == "Repeated Customer45/90":
     cohort_source = branch_filtered_df.copy()
@@ -2403,28 +2403,28 @@ if selected_page == "Repeated Customer45/90":
         if repeat_45_percentages.empty:
             st.info("No 45-day repeat percentage rows found for the selected branches.")
         else:
-            st.dataframe(style_percentage_matrix(repeat_45_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(repeat_45_percentages), width="stretch")
 
     with top_right:
         st.subheader("L90 CS Repeat")
         if repeat_90_counts.empty:
             st.info("No 90-day repeat rows found for the selected branches.")
         else:
-            st.dataframe(style_count_matrix(repeat_90_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(repeat_90_counts), width="stretch")
 
     with bottom_left:
         st.subheader("L45 CS Repeat")
         if repeat_45_counts.empty:
             st.info("No 45-day repeat rows found for the selected branches.")
         else:
-            st.dataframe(style_count_matrix(repeat_45_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(repeat_45_counts), width="stretch")
 
     with bottom_right:
         st.subheader("L90 CS Repeat %")
         if repeat_90_percentages.empty:
             st.info("No 90-day repeat percentage rows found for the selected branches.")
         else:
-            st.dataframe(style_percentage_matrix(repeat_90_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(repeat_90_percentages), width="stretch")
 
 if selected_page == "Repeat Customer L60":
     cohort_source = branch_filtered_df.copy()
@@ -2439,28 +2439,28 @@ if selected_page == "Repeat Customer L60":
         if repeat_60_counts.empty:
             st.info("No 60-day repeat rows found for the selected branches.")
         else:
-            st.dataframe(style_count_matrix(repeat_60_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(repeat_60_counts), width="stretch")
 
     with top_right:
         st.subheader("L60 by Bin Range")
         if binrange_60_counts.empty:
             st.info("No 60-day bin range rows found for the selected branches.")
         else:
-            st.dataframe(style_count_matrix(binrange_60_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(binrange_60_counts), width="stretch")
 
     with bottom_left:
         st.subheader("L60 Repeat %")
         if repeat_60_percentages.empty:
             st.info("No 60-day repeat percentage rows found for the selected branches.")
         else:
-            st.dataframe(style_percentage_matrix(repeat_60_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(repeat_60_percentages), width="stretch")
 
     with bottom_right:
         st.subheader("L60 by Bin Range %")
         if binrange_60_percentages.empty:
             st.info("No 60-day bin range percentage rows found for the selected branches.")
         else:
-            st.dataframe(style_percentage_matrix(binrange_60_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(binrange_60_percentages), width="stretch")
 
 if selected_page == "Revenue Repeat":
     revenue_source = branch_filtered_df.copy()
@@ -2475,7 +2475,7 @@ if selected_page == "Revenue Repeat":
         if revenue_counts.empty:
             st.info("No revenue repeat rows found for the selected branches.")
         else:
-            st.dataframe(style_count_matrix(revenue_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(revenue_counts), width="stretch")
 
     with top_right:
         card_cols = st.columns(2)
@@ -2491,7 +2491,7 @@ if selected_page == "Revenue Repeat":
         if revenue_percentages.empty:
             st.info("No revenue percentage rows found for the selected branches.")
         else:
-            st.dataframe(style_percentage_matrix(revenue_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(revenue_percentages), width="stretch")
 
     with bottom_right:
         st.subheader("Sales by month wise")
@@ -2507,7 +2507,7 @@ if selected_page == "Revenue Repeat":
                 color_discrete_map={"Repeat": "#69a83b", "New": "#2f3a75"},
             )
             split_chart.update_layout(yaxis_tickformat=".0%", xaxis_title=None, yaxis_title=None)
-            st.plotly_chart(split_chart, use_container_width=True)
+            st.plotly_chart(split_chart, width="stretch")
 
 if selected_page == "Revenue vs Last Month":
     current_revenue_frame = filtered_df.copy()
@@ -2535,7 +2535,7 @@ if selected_page == "Revenue vs Last Month":
     top_left, top_right = st.columns([1.4, 1.1])
     with top_left:
         st.markdown("**Metric Comparison Table**")
-        st.dataframe(style_revenue_comparison_table(revenue_metrics), use_container_width=True, hide_index=True)
+        st.dataframe(style_revenue_comparison_table(revenue_metrics), width="stretch", hide_index=True)
 
     with top_right:
         st.markdown("**Biggest Changes**")
@@ -2549,7 +2549,7 @@ if selected_page == "Revenue vs Last Month":
             color_continuous_scale="RdYlGn",
         )
         biggest_chart.update_layout(xaxis_title="Change", yaxis_title=None, coloraxis_showscale=False)
-        st.plotly_chart(biggest_chart, use_container_width=True)
+        st.plotly_chart(biggest_chart, width="stretch")
 
     bottom_left, bottom_right = st.columns(2)
     with bottom_left:
@@ -2575,7 +2575,7 @@ if selected_page == "Revenue vs Last Month":
             color_discrete_map={"Online": "#1f77b4", "Offline": "#8ec9ff"},
         )
         mix_chart.update_layout(xaxis_title=None, yaxis_title=None)
-        st.plotly_chart(mix_chart, use_container_width=True)
+        st.plotly_chart(mix_chart, width="stretch")
 
     with bottom_right:
         st.markdown("**Customer Mix Comparison**")
@@ -2602,7 +2602,7 @@ if selected_page == "Revenue vs Last Month":
             color_discrete_map={"Current": "#69a83b", "Last Month": "#2f3a75"},
         )
         customer_chart.update_layout(xaxis_title=None, yaxis_title=None)
-        st.plotly_chart(customer_chart, use_container_width=True)
+        st.plotly_chart(customer_chart, width="stretch")
 
 if selected_page == "Product Penetration":
     product_query_start = min(start_date, shift_date_one_month(start_date)).strftime("%Y-%m-%d 00:00:00")
@@ -2736,7 +2736,7 @@ if selected_page == "Product Penetration":
                         color_continuous_scale="RdYlGn",
                     )
                     revenue_chart.update_layout(xaxis_title="Revenue Change", yaxis_title=None, coloraxis_showscale=False)
-                    st.plotly_chart(revenue_chart, use_container_width=True)
+                    st.plotly_chart(revenue_chart, width="stretch")
 
                 with top_right:
                     st.markdown("**Top Quantity Movers**")
@@ -2752,7 +2752,7 @@ if selected_page == "Product Penetration":
                         color_continuous_scale="RdYlGn",
                     )
                     qty_chart.update_layout(xaxis_title="Qty Change", yaxis_title=None, coloraxis_showscale=False)
-                    st.plotly_chart(qty_chart, use_container_width=True)
+                    st.plotly_chart(qty_chart, width="stretch")
 
                 lower_left, lower_right = st.columns([1.4, 1.0])
                 with lower_left:
@@ -2797,7 +2797,7 @@ if selected_page == "Product Penetration":
                         style_product_comparison_table(
                             table_view
                         ),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=False,
                     )
 
@@ -2817,7 +2817,7 @@ if selected_page == "Product Penetration":
                         yaxis_title="Revenue Change",
                         coloraxis_showscale=False,
                     )
-                    st.plotly_chart(scatter_chart, use_container_width=True)
+                    st.plotly_chart(scatter_chart, width="stretch")
 
         with category_tab:
             category_current = product_filtered[product_filtered["category_name"] != ""].copy()
@@ -2894,7 +2894,7 @@ if selected_page == "Product Penetration":
                         color_continuous_scale="RdYlGn",
                     )
                     customer_chart.update_layout(xaxis_title="Customer Change", yaxis_title=None, coloraxis_showscale=False)
-                    st.plotly_chart(customer_chart, use_container_width=True)
+                    st.plotly_chart(customer_chart, width="stretch")
 
                 with top_right:
                     st.markdown("**Top Category Penetration Gainers**")
@@ -2914,7 +2914,7 @@ if selected_page == "Product Penetration":
                         yaxis_title=None,
                         coloraxis_showscale=False,
                     )
-                    st.plotly_chart(penetration_chart, use_container_width=True)
+                    st.plotly_chart(penetration_chart, width="stretch")
 
                 lower_left, lower_right = st.columns([1.4, 1.0])
                 with lower_left:
@@ -2965,7 +2965,7 @@ if selected_page == "Product Penetration":
                         style_category_comparison_table(
                             table_view
                         ),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=False,
                     )
 
@@ -2985,7 +2985,7 @@ if selected_page == "Product Penetration":
                         yaxis_title="Revenue Change",
                         coloraxis_showscale=False,
                     )
-                    st.plotly_chart(scatter_chart, use_container_width=True)
+                    st.plotly_chart(scatter_chart, width="stretch")
 
 if selected_page == "Monthly Wallet":
     wallet_source = branch_filtered_df.copy()
@@ -2995,7 +2995,7 @@ if selected_page == "Monthly Wallet":
     if monthly_wallet.empty:
         st.info("No monthly wallet rows found for the selected filters.")
     else:
-        st.dataframe(style_currency_matrix(monthly_wallet), use_container_width=True)
+        st.dataframe(style_currency_matrix(monthly_wallet), width="stretch")
 
 if selected_page == "Persona":
 
@@ -3063,7 +3063,7 @@ if selected_page == "Persona":
                             "last_bought": "Last Bought",
                         }
                     )
-                    st.dataframe(mix_view.head(int(recommendation_limit)), use_container_width=True, hide_index=True)
+                    st.dataframe(mix_view.head(int(recommendation_limit)), width="stretch", hide_index=True)
 
                 with top_right:
                     st.markdown("**Revenue Mix Chart**")
@@ -3073,7 +3073,7 @@ if selected_page == "Persona":
                         names="product_name",
                         values="revenue",
                     )
-                    st.plotly_chart(mix_chart, use_container_width=True)
+                    st.plotly_chart(mix_chart, width="stretch")
 
                 bottom_left, bottom_right = st.columns([1.3, 1.0])
                 with bottom_left:
@@ -3092,7 +3092,7 @@ if selected_page == "Persona":
                                 "reorder_signal": "Signal",
                             }
                         )
-                        st.dataframe(repeat_view.head(int(recommendation_limit)), use_container_width=True, hide_index=True)
+                        st.dataframe(repeat_view.head(int(recommendation_limit)), width="stretch", hide_index=True)
 
                 with bottom_right:
                     st.markdown("**Personalization Suggestions**")
@@ -3120,7 +3120,7 @@ if selected_page == "Persona":
                                     "Signal",
                                 ]
                             ],
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
 
@@ -3196,7 +3196,7 @@ if selected_page == "Churn Dashboard":
         with top_left:
             st.markdown("**Status Mix**")
             status_chart = px.pie(status_mix, names="status", values="customers")
-            st.plotly_chart(status_chart, use_container_width=True)
+            st.plotly_chart(status_chart, width="stretch")
 
         with top_mid:
             st.markdown("**Monthly Status Trend**")
@@ -3212,7 +3212,7 @@ if selected_page == "Churn Dashboard":
                     color_discrete_map={"Active": "#69a83b", "At Risk": "#f59e0b", "Churned": "#c0392b"},
                 )
                 trend_chart.update_layout(xaxis_title=None, yaxis_title=None)
-                st.plotly_chart(trend_chart, use_container_width=True)
+                st.plotly_chart(trend_chart, width="stretch")
 
         with top_right:
             st.markdown("**Segment x Status Summary**")
@@ -3229,7 +3229,7 @@ if selected_page == "Churn Dashboard":
                 )
                 selection_event = st.dataframe(
                     segment_view,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     on_select="rerun",
                     selection_mode="single-row",
@@ -3267,7 +3267,7 @@ if selected_page == "Churn Dashboard":
                         "Favorite Category",
                     ]
                 ].sort_values("Total Value", ascending=False),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -3321,7 +3321,7 @@ if selected_page == "Churn Dashboard":
                             "Action Hint",
                         ]
                     ],
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -3369,7 +3369,7 @@ if selected_page == "Churn Dashboard":
                 show_cycle_break_only = st.button(
                     "Show Cycle Break Customers",
                     key="show_cycle_break_customers",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
             reason_left, reason_right = st.columns([1.3, 1.0])
@@ -3383,7 +3383,7 @@ if selected_page == "Churn Dashboard":
                     color_continuous_scale="OrRd",
                 )
                 reason_chart.update_layout(xaxis_title="Customers", yaxis_title=None, coloraxis_showscale=False)
-                st.plotly_chart(reason_chart, use_container_width=True)
+                st.plotly_chart(reason_chart, width="stretch")
 
             with reason_right:
                 st.markdown("**High Churn Categories**")
@@ -3398,7 +3398,7 @@ if selected_page == "Churn Dashboard":
                                 "churned_revenue": "Churned Revenue",
                             }
                         ).head(12),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
 
@@ -3413,7 +3413,7 @@ if selected_page == "Churn Dashboard":
             st.markdown("**Reason Summary (Click Any Row For Customer Details)**")
             reason_selection = st.dataframe(
                 reason_select_view,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 on_select="rerun",
                 selection_mode="single-row",
@@ -3470,7 +3470,7 @@ if selected_page == "Churn Dashboard":
                 reason_detail_display = reason_detail_display.head(int(churn_list_limit))
             st.dataframe(
                 reason_detail_display,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -3485,14 +3485,14 @@ if selected_page == "Customer Count Branch Wise":
         if branch_summary.empty:
             st.info("No branch-wise rows found for the selected branches.")
         else:
-            st.dataframe(branch_summary, use_container_width=True, hide_index=True)
+            st.dataframe(branch_summary, width="stretch", hide_index=True)
 
     with top_right:
         st.subheader("Month Summary")
         if month_summary.empty:
             st.info("No month summary rows found.")
         else:
-            st.dataframe(month_summary, use_container_width=True, hide_index=True)
+            st.dataframe(month_summary, width="stretch", hide_index=True)
 
     available_months = (
         branch_source[["sales_month", "year_month_label"]]
@@ -3519,14 +3519,14 @@ if selected_page == "Customer Count Branch Wise":
         if month_day_summary.empty:
             st.info("No day-wise rows found for the selected month.")
         else:
-            st.dataframe(month_day_summary, use_container_width=True, hide_index=True)
+            st.dataframe(month_day_summary, width="stretch", hide_index=True)
 
     with bottom_mid:
         st.subheader("Users at N- and Users at N+1")
         if order_rank_summary.empty:
             st.info("No order-rank rows found for the selected month.")
         else:
-            st.dataframe(order_rank_summary, use_container_width=True, hide_index=True)
+            st.dataframe(order_rank_summary, width="stretch", hide_index=True)
 
     with bottom_right:
         st.subheader("Users at N- and Users at N+1 by Value")
@@ -3548,7 +3548,7 @@ if selected_page == "Customer Count Branch Wise":
                 barmode="group",
                 color_discrete_map={"Users at N-": "#69a83b", "Users at N+1": "#2f3a75"},
             )
-            st.plotly_chart(rank_chart, use_container_width=True)
+            st.plotly_chart(rank_chart, width="stretch")
 
 if selected_page == "Order Repeat":
     order_source = branch_filtered_df[~branch_filtered_df["is_b2b"]].copy()
@@ -3564,28 +3564,28 @@ if selected_page == "Order Repeat":
         if mom_order_counts.empty:
             st.info("No order cohort rows found.")
         else:
-            st.dataframe(style_count_matrix(mom_order_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(mom_order_counts), width="stretch")
 
     with top_right:
         st.subheader("Order Count AOV Distribution")
         if aov_distribution.empty:
             st.info("No AOV distribution rows found.")
         else:
-            st.dataframe(style_count_matrix(aov_distribution), use_container_width=True)
+            st.dataframe(style_count_matrix(aov_distribution), width="stretch")
 
     with bottom_left:
         st.subheader("MoM Order Count %")
         if mom_order_percentages.empty:
             st.info("No MoM order percentage rows found.")
         else:
-            st.dataframe(style_percentage_matrix(mom_order_percentages), use_container_width=True)
+            st.dataframe(style_percentage_matrix(mom_order_percentages), width="stretch")
 
     with bottom_right:
         st.subheader("L45 Repeat Orders")
         if l45_order_counts.empty:
             st.info("No L45 repeat order rows found.")
         else:
-            st.dataframe(style_count_matrix(l45_order_counts), use_container_width=True)
+            st.dataframe(style_count_matrix(l45_order_counts), width="stretch")
 
 if selected_page == "Tags":
     tags_source = branch_filtered_df.copy()
@@ -3677,7 +3677,7 @@ if selected_page == "Tags":
                 metric_cols[1].metric("1000+ Customers", f"{int((tag_spend['Spend'] >= 1000).sum()):,}")
                 metric_cols[2].metric("5000+ Customers", f"{int((tag_spend['Spend'] >= 5000).sum()):,}")
                 metric_cols[3].metric("10000+ Customers", f"{int((tag_spend['Spend'] >= 10000).sum()):,}")
-                st.dataframe(tag_spend, use_container_width=True, hide_index=True)
+                st.dataframe(tag_spend, width="stretch", hide_index=True)
 
         with tags_chart:
             top_left, top_right = st.columns(2)
@@ -3693,7 +3693,7 @@ if selected_page == "Tags":
                         color="Gift Name",
                     )
                     gift_chart.update_layout(showlegend=False, xaxis_title=None, yaxis_title=None)
-                    st.plotly_chart(gift_chart, use_container_width=True)
+                    st.plotly_chart(gift_chart, width="stretch")
             with top_right:
                 st.subheader("Customer Spend Split")
                 split_source = tag_chart_source[tag_chart_source["chart"] == "Customer Split"].copy()
@@ -3701,28 +3701,28 @@ if selected_page == "Tags":
                     st.info("No spend split rows found for the selected month.")
                 else:
                     split_chart = px.pie(split_source, names="label", values="value")
-                    st.plotly_chart(split_chart, use_container_width=True)
+                    st.plotly_chart(split_chart, width="stretch")
 
         with tags_below:
             st.subheader("Below 1000")
             if tag_below.empty:
                 st.info("No customers below 1000 for the selected month.")
             else:
-                st.dataframe(tag_below, use_container_width=True, hide_index=True)
+                st.dataframe(tag_below, width="stretch", hide_index=True)
 
         with tags_inventory:
             st.subheader("Inventory")
             if tag_inventory.empty:
                 st.info("No inventory rows found for the selected month.")
             else:
-                st.dataframe(tag_inventory, use_container_width=True, hide_index=True)
+                st.dataframe(tag_inventory, width="stretch", hide_index=True)
 
         with tags_daily:
             st.subheader("Daily Tag Counts")
             if tag_daily.empty:
                 st.info("No daily tag rows found for the selected month.")
             else:
-                st.dataframe(tag_daily, use_container_width=True, hide_index=True)
+                st.dataframe(tag_daily, width="stretch", hide_index=True)
 
         with tags_comparison:
             st.subheader(
@@ -3848,13 +3848,13 @@ if selected_page == "Tags":
                 if tag_day_compare.empty:
                     st.info("No day-by-day comparison rows found.")
                 else:
-                    st.dataframe(tag_day_compare, use_container_width=True, hide_index=True)
+                    st.dataframe(tag_day_compare, width="stretch", hide_index=True)
             with top_right:
                 st.markdown("**Week By Week**")
                 if tag_week_compare.empty:
                     st.info("No week-by-week comparison rows found.")
                 else:
-                    st.dataframe(tag_week_compare, use_container_width=True, hide_index=True)
+                    st.dataframe(tag_week_compare, width="stretch", hide_index=True)
 
             bottom_left, bottom_right = st.columns([1.1, 1.4])
             with bottom_left:
@@ -3862,7 +3862,7 @@ if selected_page == "Tags":
                 if tag_daytype_compare.empty:
                     st.info("No weekday/weekend comparison rows found.")
                 else:
-                    st.dataframe(tag_daytype_compare, use_container_width=True, hide_index=True)
+                    st.dataframe(tag_daytype_compare, width="stretch", hide_index=True)
             with bottom_right:
                 if tag_day_compare.empty:
                     st.info("No comparison chart rows found.")
@@ -3882,4 +3882,5 @@ if selected_page == "Tags":
                         markers=True,
                     )
                     compare_chart.update_layout(xaxis_title=None, yaxis_title=None)
-                    st.plotly_chart(compare_chart, use_container_width=True)
+                    st.plotly_chart(compare_chart, width="stretch")
+
