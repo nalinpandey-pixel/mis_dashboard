@@ -1687,7 +1687,17 @@ def run_sync(args: argparse.Namespace) -> int:
             full_refresh=False,
             delete_window_utc=(rebuild_start_utc, rebuild_end_utc),
         )
+        target_config = load_target_supabase_config()
+        persist_to_target_supabase(
+            target_config,
+            raw_df,
+            cleaned_df,
+            removed_rows,
+            full_refresh=False,
+            delete_window_utc=(rebuild_start_utc, rebuild_end_utc),
+        )
         print("Local SQLite yesterday rebuild complete: {0}".format(db_path))
+        print("Target Supabase yesterday rebuild complete.")
         print("State file left unchanged after yesterday rebuild.")
         return 0
 
@@ -1726,6 +1736,16 @@ def run_sync(args: argparse.Namespace) -> int:
         delete_window_utc=None if args.full_refresh else (fetch_start_utc, None),
         historical_seed_df=historical_seed_df,
     )
+    target_config = load_target_supabase_config()
+    persist_to_target_supabase(
+        target_config,
+        raw_df,
+        cleaned_df,
+        removed_rows,
+        full_refresh=args.full_refresh,
+        delete_window_utc=None if args.full_refresh else (fetch_start_utc, None),
+        historical_seed_df=historical_seed_df,
+    )
     if summary.source_max_utc:
         write_state(state_path, summary.source_max_utc)
         print("Updated state to {0}".format(summary.source_max_utc))
@@ -1733,6 +1753,7 @@ def run_sync(args: argparse.Namespace) -> int:
         print("State file left unchanged because no source timestamp was found.")
 
     print("Local SQLite refresh complete: {0}".format(db_path))
+    print("Target Supabase refresh complete.")
     return 0
 
 
