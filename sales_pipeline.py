@@ -1152,6 +1152,16 @@ def supabase_headers(config: SupabaseConfig, extra: Optional[Dict[str, str]] = N
     return headers
 
 
+def supabase_quote_literal(value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def build_supabase_in_filter(values: List[Any]) -> str:
+    return "(" + ",".join(supabase_quote_literal(value) for value in values) + ")"
+
+
 def delete_remote_rows(
     config: SupabaseConfig,
     table_name: str,
@@ -1192,7 +1202,7 @@ def post_remote_rows(
     session = requests.Session()
     session.trust_env = False
     for index in range(0, len(rows), FETCH_PAGE_SIZE):
-        chunk = rows[index : index + FETCH_PAGE_SIZE]
+        chunk = [sanitize_json_record(row) for row in rows[index : index + FETCH_PAGE_SIZE]]
         response = session.post(
             "{0}/rest/v1/{1}".format(config.url, table_name),
             headers=headers,
@@ -1210,6 +1220,76 @@ def utc_to_sales_raw_text(value: str) -> str:
         .tz_localize(None)
         .strftime("%Y-%m-%d %H:%M:%S")
     )
+
+
+def sanitize_json_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value is pd.NaT:
+        return None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sanitize_json_value(item) for key, item in value.items()}
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    return value
+
+
+def sanitize_json_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: sanitize_json_value(value) for key, value in record.items()}
+
+
+def dedupe_sales_raw_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen_keys = set()
+    for row in rows:
+        key = (
+            row.get("sales_no"),
+            row.get("mob_no"),
+            row.get("sales_date"),
+            row.get("branch_code"),
+            row.get("order_type"),
+            row.get("net_amount"),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def delete_remote_sales_raw_conflicts(
+    config: SupabaseConfig,
+    table_name: str,
+    rows: List[Dict[str, Any]],
+) -> None:
+    sales_nos = sorted(
+        {
+            str(row.get("sales_no")).strip()
+            for row in rows
+            if row.get("sales_no") is not None and str(row.get("sales_no")).strip()
+        }
+    )
+    if not sales_nos:
+        return
+
+    for index in range(0, len(sales_nos), FETCH_PAGE_SIZE):
+        batch = sales_nos[index : index + FETCH_PAGE_SIZE]
+        delete_remote_rows(
+            config,
+            table_name,
+            {"sales_no": f"in.{build_supabase_in_filter(batch)}"},
+        )
 
 
 def prepare_remote_cleaned_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -1315,7 +1395,7 @@ def prepare_remote_raw_history_rows(raw_df: pd.DataFrame) -> List[Dict[str, Any]
         for key, value in list(record.items()):
             if isinstance(value, bool):
                 record[key] = int(value)
-        normalized_rows.append(record)
+        normalized_rows.append(sanitize_json_record(record))
     return normalized_rows
 
 
@@ -1598,7 +1678,7 @@ def persist_to_target_supabase(
     cleaned_payload = prepare_remote_cleaned_rows(cleaned_df)
     removed_payload = prepare_remote_removed_rows(removed_rows)
     starting_id = 0 if full_refresh else fetch_remote_max_sales_raw_id(config, sales_raw_table)
-    sales_raw_payload = prepare_remote_sales_raw_rows(cleaned_df, starting_id)
+    sales_raw_payload = dedupe_sales_raw_payload(prepare_remote_sales_raw_rows(cleaned_df, starting_id))
     raw_history_payload = prepare_remote_raw_history_rows(raw_df)
     historical_seed_payload = prepare_remote_historical_seed_rows(historical_seed_df) if historical_seed_df is not None else []
 
@@ -1606,6 +1686,8 @@ def persist_to_target_supabase(
     post_remote_rows(config, removed_table, removed_payload, upsert=True, on_conflict="removed_id")
     if full_refresh and historical_seed_payload:
         post_remote_rows(config, sales_raw_table, historical_seed_payload, upsert=False)
+    elif sales_raw_payload:
+        delete_remote_sales_raw_conflicts(config, sales_raw_table, sales_raw_payload)
     post_remote_rows(config, sales_raw_table, sales_raw_payload, upsert=False)
     post_remote_rows(config, history_table, raw_history_payload, upsert=True, on_conflict="_row_hash")
 
