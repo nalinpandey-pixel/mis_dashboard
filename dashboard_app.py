@@ -2206,7 +2206,7 @@ st.set_page_config(page_title="MIS Reporting Dashboard", layout="wide")
 st.title("MIS Reporting Dashboard")
 st.caption("Live historical + latest cleaned sales from Supabase")
 
-refresh_col, rebuild_col, status_col = st.columns([0.18, 0.22, 0.60])
+refresh_col, rebuild_today_col, rebuild_yesterday_col, status_col = st.columns([0.16, 0.20, 0.22, 0.42])
 with refresh_col:
     if st.button("Refresh till now", width="stretch"):
         with st.spinner("Refreshing latest data..."):
@@ -2220,7 +2220,19 @@ with refresh_col:
         if message:
             st.code(message)
 
-with rebuild_col:
+with rebuild_today_col:
+    if st.button("Rebuild Today", width="stretch"):
+        with st.spinner("Deleting and rebuilding today data..."):
+            ok, message = run_pipeline_command("--rebuild-today")
+        st.cache_data.clear()
+        if ok:
+            st.success("Today data rebuilt.")
+        else:
+            st.error("Today rebuild failed.")
+        if message:
+            st.code(message)
+
+with rebuild_yesterday_col:
     if st.button("Rebuild Yesterday", width="stretch"):
         with st.spinner("Deleting and rebuilding yesterday data..."):
             ok, message = run_pipeline_command("--rebuild-yesterday")
@@ -3668,6 +3680,10 @@ if selected_page == "Order Repeat":
 
 if selected_page == "Tags":
     tags_source = branch_filtered_df.copy()
+    if "type" in tags_source.columns:
+        tags_source = tags_source[tags_source["type"].fillna("").astype(str).str.strip().str.lower() != "invoice"].copy()
+    elif "order_type" in tags_source.columns:
+        tags_source = tags_source[tags_source["order_type"].fillna("").astype(str).str.strip().ne("")].copy()
     available_tag_months = (
         tags_source[["sales_month", "year_month_label"]]
         .drop_duplicates()
