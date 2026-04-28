@@ -6,7 +6,7 @@ import os
 import sqlite3
 import time as time_module
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -448,7 +448,7 @@ def clean_sales_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame,
     source_rows = len(df)
     source_amount = float(clean_numeric_series(df["Amount"]).sum()) if "Amount" in df.columns else 0.0
 
-    for column in df.select_dtypes(include="object").columns:
+    for column in df.select_dtypes(include=["object", "string"]).columns:
         df[column] = normalize_text_series(df[column])
 
     df["sales_date_utc"] = parse_utc_series(df["Date"])
@@ -522,7 +522,7 @@ def clean_sales_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame,
         aggregated["sales_date"] = aggregated["Date"].dt.date
         aggregated["sales_date_utc"] = aggregated["sales_date_utc"].dt.tz_convert("UTC")
         aggregated["source_table"] = SOURCE_TABLE
-        aggregated["synced_at"] = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        aggregated["synced_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         aggregated["record_id"] = aggregated.apply(build_record_id, axis=1)
 
     removed_rows = pd.concat(removed_frames, ignore_index=True) if removed_frames else pd.DataFrame()
@@ -804,7 +804,7 @@ def prepare_sqlite_removed_rows(df: pd.DataFrame) -> List[Tuple[Any, ...]]:
                 float(row["Amount"]) if pd.notna(row.get("Amount")) else None,
                 row["Removal_Reason"],
                 SOURCE_TABLE,
-                datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
                 json.dumps(row.dropna().to_dict(), default=str, sort_keys=True),
             )
         )
@@ -976,7 +976,7 @@ def prepare_raw_history_rows(raw_df: pd.DataFrame) -> Tuple[List[str], List[Tupl
 
     raw_copy = raw_df.copy()
     raw_copy = raw_copy.where(pd.notna(raw_copy), None)
-    raw_copy["_synced_at"] = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    raw_copy["_synced_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     raw_copy["_source_table"] = SOURCE_TABLE
     raw_copy["_row_hash"] = raw_copy.apply(
         lambda row: hashlib.sha256(
