@@ -120,6 +120,11 @@ def parse_args() -> argparse.Namespace:
         help="Delete local yesterday data and fetch that full local day again from Supabase.",
     )
     parser.add_argument(
+        "--rebuild-today",
+        action="store_true",
+        help="Delete local today data and fetch that full local day again from Supabase.",
+    )
+    parser.add_argument(
         "--watch",
         action="store_true",
         help="Keep syncing in a loop.",
@@ -580,6 +585,17 @@ def build_yesterday_window_utc(reference_time: Optional[datetime] = None) -> Tup
     yesterday_local = (local_now - pd.Timedelta(days=1)).normalize()
     local_end = yesterday_local + pd.Timedelta(days=1)
     return yesterday_local.tz_convert("UTC").isoformat(), local_end.tz_convert("UTC").isoformat()
+
+
+def build_today_window_utc(reference_time: Optional[datetime] = None) -> Tuple[str, str]:
+    local_now = (
+        pd.Timestamp(reference_time).tz_convert(LOCAL_TIMEZONE)
+        if reference_time and pd.Timestamp(reference_time).tzinfo is not None
+        else pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    )
+    today_local = local_now.normalize()
+    local_end = today_local + pd.Timedelta(days=1)
+    return today_local.tz_convert("UTC").isoformat(), local_end.tz_convert("UTC").isoformat()
 
 
 def build_record_id(row: pd.Series) -> str:
@@ -1670,10 +1686,38 @@ def persist_to_target_supabase(
         delete_remote_rows(config, history_table, {"_row_hash": "not.is.null"})
     elif delete_window_utc:
         start_utc = delete_window_utc[0]
-        delete_remote_rows(config, cleaned_table, {"sales_date_utc": "gte.{0}".format(start_utc)})
-        delete_remote_rows(config, removed_table, {"sales_date_utc": "gte.{0}".format(start_utc)})
-        delete_remote_rows(config, sales_raw_table, {"sales_date": "gte.{0}".format(utc_to_sales_raw_text(start_utc))})
-        delete_remote_rows(config, history_table, {"sales_date": "gte.{0}".format(start_utc)})
+        end_utc = delete_window_utc[1]
+        if end_utc:
+            delete_remote_rows(
+                config,
+                cleaned_table,
+                {"and": "(sales_date_utc.gte.{0},sales_date_utc.lt.{1})".format(start_utc, end_utc)},
+            )
+            delete_remote_rows(
+                config,
+                removed_table,
+                {"and": "(sales_date_utc.gte.{0},sales_date_utc.lt.{1})".format(start_utc, end_utc)},
+            )
+            delete_remote_rows(
+                config,
+                sales_raw_table,
+                {
+                    "and": "(sales_date.gte.{0},sales_date.lt.{1})".format(
+                        utc_to_sales_raw_text(start_utc),
+                        utc_to_sales_raw_text(end_utc),
+                    )
+                },
+            )
+            delete_remote_rows(
+                config,
+                history_table,
+                {"and": "(sales_date.gte.{0},sales_date.lt.{1})".format(start_utc, end_utc)},
+            )
+        else:
+            delete_remote_rows(config, cleaned_table, {"sales_date_utc": "gte.{0}".format(start_utc)})
+            delete_remote_rows(config, removed_table, {"sales_date_utc": "gte.{0}".format(start_utc)})
+            delete_remote_rows(config, sales_raw_table, {"sales_date": "gte.{0}".format(utc_to_sales_raw_text(start_utc))})
+            delete_remote_rows(config, history_table, {"sales_date": "gte.{0}".format(start_utc)})
 
     cleaned_payload = prepare_remote_cleaned_rows(cleaned_df)
     removed_payload = prepare_remote_removed_rows(removed_rows)
@@ -1743,6 +1787,57 @@ def run_sync(args: argparse.Namespace) -> int:
         return sync_local_backup_to_target_supabase(args, db_path)
 
     source_config = load_source_supabase_config()
+
+    if args.rebuild_today:
+        rebuild_start_utc, rebuild_end_utc = build_today_window_utc()
+        raw_df, cleaned_df, removed_rows, summary = load_rebuild_window_data(
+            config=source_config,
+            start_utc=rebuild_start_utc,
+            end_utc=rebuild_end_utc,
+        )
+
+        export_excel_if_requested(cleaned_df, args.cleaned_output)
+        export_excel_if_requested(removed_rows, args.removed_output)
+
+        print(
+            "Rebuilding local today window from {0} to {1} ({2})".format(
+                rebuild_start_utc,
+                rebuild_end_utc,
+                LOCAL_TIMEZONE,
+            )
+        )
+        print("Source rows: {0:,}".format(summary.source_rows))
+        print("Removed rows: {0:,}".format(summary.removed_rows))
+        print("Grouped cleaned rows: {0:,}".format(summary.cleaned_rows))
+        print("Source amount: {0:,.2f}".format(summary.source_amount))
+        print("Removed amount: {0:,.2f}".format(summary.removed_amount))
+        print("Cleaned amount: {0:,.2f}".format(summary.cleaned_amount))
+
+        persist_to_local_db(
+            db_path,
+            raw_df,
+            cleaned_df,
+            removed_rows,
+            full_refresh=False,
+            delete_window_utc=(rebuild_start_utc, rebuild_end_utc),
+        )
+        target_config = load_target_supabase_config()
+        persist_to_target_supabase(
+            target_config,
+            raw_df,
+            cleaned_df,
+            removed_rows,
+            full_refresh=False,
+            delete_window_utc=(rebuild_start_utc, rebuild_end_utc),
+            cleaned_table=args.target_cleaned_table,
+            removed_table=args.target_removed_table,
+            sales_raw_table=args.target_sales_raw_table,
+            history_table=args.target_history_table,
+        )
+        print("Local SQLite today rebuild complete: {0}".format(db_path))
+        print("Target Supabase today rebuild complete.")
+        print("State file left unchanged after today rebuild.")
+        return 0
 
     if args.rebuild_yesterday:
         rebuild_start_utc, rebuild_end_utc = build_yesterday_window_utc()
