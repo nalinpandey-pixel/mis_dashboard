@@ -35,6 +35,10 @@ LOCAL_REMOVED_TABLE = "sales_removed_local"
 HISTORICAL_TABLE = "sales_raw"
 RAW_HISTORY_TABLE = "sales_items_history"
 JOINED_HISTORY_TABLE = "sales_items_joined"
+TARGET_CLEANED_BACKUP_TABLE = "sales_cleaned_local_backup"
+TARGET_REMOVED_BACKUP_TABLE = "sales_removed_local_backup"
+TARGET_SALES_RAW_BACKUP_TABLE = "sales_raw_backup"
+TARGET_HISTORY_BACKUP_TABLE = "sales_items_history_backup"
 SALES_RAW_COLUMNS = {
     "id",
     "sales_date",
@@ -151,22 +155,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target-cleaned-table",
-        default="sales_cleaned_local_backup",
+        default=TARGET_CLEANED_BACKUP_TABLE,
         help="Target Supabase table for local cleaned rows backup.",
     )
     parser.add_argument(
         "--target-removed-table",
-        default="sales_removed_local_backup",
+        default=TARGET_REMOVED_BACKUP_TABLE,
         help="Target Supabase table for local removed rows backup.",
     )
     parser.add_argument(
         "--target-sales-raw-table",
-        default="sales_raw_backup",
+        default=TARGET_SALES_RAW_BACKUP_TABLE,
         help="Target Supabase table for local sales_raw backup.",
     )
     parser.add_argument(
         "--target-history-table",
-        default="sales_items_history_backup",
+        default=TARGET_HISTORY_BACKUP_TABLE,
         help="Target Supabase table for local sales_items_history backup.",
     )
     parser.add_argument(
@@ -1247,11 +1251,11 @@ def prepare_remote_removed_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return rows
 
 
-def fetch_remote_max_sales_raw_id(config: SupabaseConfig) -> int:
+def fetch_remote_max_sales_raw_id(config: SupabaseConfig, table_name: str) -> int:
     session = requests.Session()
     session.trust_env = False
     response = session.get(
-        "{0}/rest/v1/{1}".format(config.url, HISTORICAL_TABLE),
+        "{0}/rest/v1/{1}".format(config.url, table_name),
         headers=supabase_headers(config),
         params={"select": "id", "order": "id.desc", "limit": 1},
         timeout=30,
@@ -1574,32 +1578,36 @@ def persist_to_target_supabase(
     full_refresh: bool,
     delete_window_utc: Optional[Tuple[str, Optional[str]]] = None,
     historical_seed_df: Optional[pd.DataFrame] = None,
+    cleaned_table: str = TARGET_CLEANED_BACKUP_TABLE,
+    removed_table: str = TARGET_REMOVED_BACKUP_TABLE,
+    sales_raw_table: str = TARGET_SALES_RAW_BACKUP_TABLE,
+    history_table: str = TARGET_HISTORY_BACKUP_TABLE,
 ) -> None:
     if full_refresh:
-        delete_remote_rows(config, LOCAL_CLEANED_TABLE, {"record_id": "not.is.null"})
-        delete_remote_rows(config, LOCAL_REMOVED_TABLE, {"removed_id": "not.is.null"})
-        delete_remote_rows(config, HISTORICAL_TABLE, {"id": "gt.0"})
-        delete_remote_rows(config, RAW_HISTORY_TABLE, {"_row_hash": "not.is.null"})
+        delete_remote_rows(config, cleaned_table, {"record_id": "not.is.null"})
+        delete_remote_rows(config, removed_table, {"removed_id": "not.is.null"})
+        delete_remote_rows(config, sales_raw_table, {"id": "gt.0"})
+        delete_remote_rows(config, history_table, {"_row_hash": "not.is.null"})
     elif delete_window_utc:
         start_utc = delete_window_utc[0]
-        delete_remote_rows(config, LOCAL_CLEANED_TABLE, {"sales_date_utc": "gte.{0}".format(start_utc)})
-        delete_remote_rows(config, LOCAL_REMOVED_TABLE, {"sales_date_utc": "gte.{0}".format(start_utc)})
-        delete_remote_rows(config, HISTORICAL_TABLE, {"sales_date": "gte.{0}".format(utc_to_sales_raw_text(start_utc))})
-        delete_remote_rows(config, RAW_HISTORY_TABLE, {"sales_date": "gte.{0}".format(start_utc)})
+        delete_remote_rows(config, cleaned_table, {"sales_date_utc": "gte.{0}".format(start_utc)})
+        delete_remote_rows(config, removed_table, {"sales_date_utc": "gte.{0}".format(start_utc)})
+        delete_remote_rows(config, sales_raw_table, {"sales_date": "gte.{0}".format(utc_to_sales_raw_text(start_utc))})
+        delete_remote_rows(config, history_table, {"sales_date": "gte.{0}".format(start_utc)})
 
     cleaned_payload = prepare_remote_cleaned_rows(cleaned_df)
     removed_payload = prepare_remote_removed_rows(removed_rows)
-    starting_id = 0 if full_refresh else fetch_remote_max_sales_raw_id(config)
+    starting_id = 0 if full_refresh else fetch_remote_max_sales_raw_id(config, sales_raw_table)
     sales_raw_payload = prepare_remote_sales_raw_rows(cleaned_df, starting_id)
     raw_history_payload = prepare_remote_raw_history_rows(raw_df)
     historical_seed_payload = prepare_remote_historical_seed_rows(historical_seed_df) if historical_seed_df is not None else []
 
-    post_remote_rows(config, LOCAL_CLEANED_TABLE, cleaned_payload, upsert=True, on_conflict="record_id")
-    post_remote_rows(config, LOCAL_REMOVED_TABLE, removed_payload, upsert=True, on_conflict="removed_id")
+    post_remote_rows(config, cleaned_table, cleaned_payload, upsert=True, on_conflict="record_id")
+    post_remote_rows(config, removed_table, removed_payload, upsert=True, on_conflict="removed_id")
     if full_refresh and historical_seed_payload:
-        post_remote_rows(config, HISTORICAL_TABLE, historical_seed_payload, upsert=False)
-    post_remote_rows(config, HISTORICAL_TABLE, sales_raw_payload, upsert=False)
-    post_remote_rows(config, RAW_HISTORY_TABLE, raw_history_payload, upsert=True, on_conflict="_row_hash")
+        post_remote_rows(config, sales_raw_table, historical_seed_payload, upsert=False)
+    post_remote_rows(config, sales_raw_table, sales_raw_payload, upsert=False)
+    post_remote_rows(config, history_table, raw_history_payload, upsert=True, on_conflict="_row_hash")
 
 
 def load_cleaned_sales_data(
@@ -1695,6 +1703,10 @@ def run_sync(args: argparse.Namespace) -> int:
             removed_rows,
             full_refresh=False,
             delete_window_utc=(rebuild_start_utc, rebuild_end_utc),
+            cleaned_table=args.target_cleaned_table,
+            removed_table=args.target_removed_table,
+            sales_raw_table=args.target_sales_raw_table,
+            history_table=args.target_history_table,
         )
         print("Local SQLite yesterday rebuild complete: {0}".format(db_path))
         print("Target Supabase yesterday rebuild complete.")
@@ -1745,6 +1757,10 @@ def run_sync(args: argparse.Namespace) -> int:
         full_refresh=args.full_refresh,
         delete_window_utc=None if args.full_refresh else (fetch_start_utc, None),
         historical_seed_df=historical_seed_df,
+        cleaned_table=args.target_cleaned_table,
+        removed_table=args.target_removed_table,
+        sales_raw_table=args.target_sales_raw_table,
+        history_table=args.target_history_table,
     )
     if summary.source_max_utc:
         write_state(state_path, summary.source_max_utc)
