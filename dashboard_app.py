@@ -526,6 +526,282 @@ def build_persona_recommendations(frame: pd.DataFrame, limit: int) -> pd.DataFra
     return ranked.head(limit)
 
 
+def build_customer_order_sequence(sales_frame: pd.DataFrame) -> pd.DataFrame:
+    if sales_frame.empty:
+        return pd.DataFrame(columns=["phone", "order_rank", "sales_no", "sales_day", "order_value"])
+
+    sequence = sales_frame[
+        (sales_frame["phone"] != WALKIN_PLACEHOLDER)
+        & (~sales_frame["is_b2b"])
+        & sales_frame["order_id"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+    if sequence.empty:
+        return pd.DataFrame(columns=["phone", "order_rank", "sales_no", "sales_day", "order_value"])
+
+    sequence["sales_no"] = sequence["order_id"].fillna("").astype(str).str.strip()
+    order_sequence = (
+        sequence.groupby(["phone", "sales_no"], as_index=False)
+        .agg(
+            sales_day=("sales_day", "min"),
+            order_value=("amount", "sum"),
+        )
+        .sort_values(["phone", "sales_day", "sales_no"])
+    )
+    order_sequence["order_rank"] = order_sequence.groupby("phone").cumcount() + 1
+    return order_sequence
+
+
+@st.cache_data(ttl=600, max_entries=8)
+def load_order_category_rows(order_ids: Tuple[str, ...]) -> pd.DataFrame:
+    cleaned_order_ids = [
+        order_id.strip()
+        for order_id in order_ids
+        if str(order_id).strip() and str(order_id).strip().lower() not in {"none", "nan"}
+    ]
+    if not cleaned_order_ids:
+        return pd.DataFrame(columns=["sales_no", "mob_no", "category_name", "net_amount", "qty"])
+
+    frames: List[pd.DataFrame] = []
+    for start_idx in range(0, len(cleaned_order_ids), 150):
+        batch = cleaned_order_ids[start_idx : start_idx + 150]
+        batch_frame = load_supabase_table(
+            SUPABASE_HISTORY_TABLE,
+            select_columns="sales_no,mob_no,category_name,net_amount,qty",
+            filters={"sales_no": f"in.{build_supabase_in_filter(batch)}"},
+            order_column=None,
+        )
+        if not batch_frame.empty:
+            frames.append(batch_frame)
+
+    if not frames:
+        return pd.DataFrame(columns=["sales_no", "mob_no", "category_name", "net_amount", "qty"])
+
+    frame = pd.concat(frames, ignore_index=True)
+    frame["sales_no"] = frame["sales_no"].fillna("").astype(str).str.strip()
+    frame["mob_no"] = frame["mob_no"].fillna("").astype(str).str.strip()
+    frame["category_name"] = frame["category_name"].fillna("").astype(str).str.strip()
+    frame["net_amount"] = pd.to_numeric(frame["net_amount"], errors="coerce").fillna(0.0)
+    frame["qty"] = pd.to_numeric(frame["qty"], errors="coerce").fillna(0.0)
+    frame = frame[frame["category_name"] != ""].copy()
+    return frame
+
+
+def prepare_order_category_set(category_rows: pd.DataFrame) -> pd.DataFrame:
+    if category_rows.empty:
+        return pd.DataFrame(columns=["sales_no", "category_name", "category_revenue", "category_qty"])
+    return (
+        category_rows.groupby(["sales_no", "category_name"], as_index=False)
+        .agg(
+            category_revenue=("net_amount", "sum"),
+            category_qty=("qty", "sum"),
+        )
+    )
+
+
+def build_category_transition_tables(
+    order_sequence: pd.DataFrame,
+    source_categories: pd.DataFrame,
+    target_categories: pd.DataFrame,
+    from_rank: int,
+    to_rank: int,
+    selected_category: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if order_sequence.empty or source_categories.empty or target_categories.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    from_orders = order_sequence[order_sequence["order_rank"] == from_rank].copy()
+    to_orders = order_sequence[order_sequence["order_rank"] == to_rank].copy()
+    if from_orders.empty or to_orders.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    source = from_orders.merge(source_categories, on="sales_no", how="inner")
+    source = source[source["category_name"] == selected_category].copy()
+    if source.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    target = to_orders.merge(target_categories, on="sales_no", how="inner")
+    target = target.rename(
+        columns={
+            "sales_no": "target_order_id",
+            "sales_day": "target_order_day",
+            "order_value": "target_order_value",
+            "category_name": "target_category",
+            "category_revenue": "target_category_revenue",
+            "category_qty": "target_category_qty",
+        }
+    )
+    source_customers = source[["phone", "sales_no", "sales_day", "order_value"]].drop_duplicates("phone")
+    source_customers = source_customers.rename(
+        columns={
+            "sales_no": "source_order_id",
+            "sales_day": "source_order_day",
+            "order_value": "source_order_value",
+        }
+    )
+    detail = source_customers.merge(target, on="phone", how="inner")
+    if detail.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    summary = (
+        detail.groupby("target_category", as_index=False)
+        .agg(
+            unique_customers=("phone", "nunique"),
+            target_orders=("target_order_id", "nunique"),
+            target_revenue=("target_category_revenue", "sum"),
+            target_qty=("target_category_qty", "sum"),
+        )
+        .sort_values(["unique_customers", "target_revenue"], ascending=[False, False])
+    )
+    total_source_customers = max(source_customers["phone"].nunique(), 1)
+    summary["customer_share_pct"] = (summary["unique_customers"] / total_source_customers * 100).round(2)
+    return summary, detail
+
+
+def render_category_transition_view(
+    order_sequence: pd.DataFrame,
+    from_rank: int,
+    to_rank: int,
+    key_prefix: str,
+) -> None:
+    source_orders = order_sequence[order_sequence["order_rank"] == from_rank].copy()
+    target_orders = order_sequence[order_sequence["order_rank"] == to_rank].copy()
+    if source_orders.empty or target_orders.empty:
+        st.info("Not enough customer order history found for this transition.")
+        return
+
+    source_order_ids = tuple(sorted(source_orders["sales_no"].dropna().astype(str).unique().tolist()))
+    target_order_ids = tuple(sorted(target_orders["sales_no"].dropna().astype(str).unique().tolist()))
+    source_category_rows = load_order_category_rows(source_order_ids)
+    target_category_rows = load_order_category_rows(target_order_ids)
+    source_categories = prepare_order_category_set(source_category_rows)
+    target_categories = prepare_order_category_set(target_category_rows)
+
+    if source_categories.empty:
+        st.info("No category rows found for the source order number.")
+        return
+
+    category_options = sorted(source_categories["category_name"].dropna().astype(str).unique().tolist())
+    if not category_options:
+        st.info("No categories found for the source order number.")
+        return
+
+    filter_col, limit_col = st.columns([1.2, 0.5])
+    selected_category = filter_col.selectbox(
+        f"{from_rank}{'st' if from_rank == 1 else 'nd'} order category",
+        category_options,
+        key=f"{key_prefix}_source_category",
+    )
+    detail_limit = int(
+        limit_col.number_input(
+            "Customers to show",
+            min_value=10,
+            max_value=5000,
+            value=200,
+            step=10,
+            key=f"{key_prefix}_detail_limit",
+        )
+    )
+
+    summary, detail = build_category_transition_tables(
+        order_sequence,
+        source_categories,
+        target_categories,
+        from_rank,
+        to_rank,
+        selected_category,
+    )
+
+    source_customer_count = int(
+        source_orders.merge(
+            source_categories[source_categories["category_name"] == selected_category][["sales_no"]],
+            on="sales_no",
+            how="inner",
+        )["phone"].nunique()
+    )
+    transitioned_customer_count = 0 if detail.empty else int(detail["phone"].nunique())
+    transition_rate = 0.0 if source_customer_count == 0 else transitioned_customer_count / source_customer_count * 100
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Source Customers", f"{source_customer_count:,}")
+    metric_cols[1].metric("Next Order Customers", f"{transitioned_customer_count:,}")
+    metric_cols[2].metric("Transition Rate", f"{transition_rate:.2f}%")
+    metric_cols[3].metric("Next Categories", f"{0 if summary.empty else summary['target_category'].nunique():,}")
+
+    if summary.empty:
+        st.info("No next-order category movement found for the selected category.")
+        return
+
+    top_left, top_right = st.columns([1.1, 1.2])
+    with top_left:
+        st.markdown("**Next Order Category Mix**")
+        summary_view = summary.rename(
+            columns={
+                "target_category": "Next Order Category",
+                "unique_customers": "Unique Customers",
+                "target_orders": "Orders",
+                "target_revenue": "Revenue",
+                "target_qty": "Qty",
+                "customer_share_pct": "Customer Share %",
+            }
+        )
+        st.dataframe(summary_view, width="stretch", hide_index=True)
+
+    with top_right:
+        chart_source = summary.head(20).sort_values("unique_customers")
+        transition_chart = px.bar(
+            chart_source,
+            x="unique_customers",
+            y="target_category",
+            orientation="h",
+            color="unique_customers",
+            color_continuous_scale="Blues",
+        )
+        transition_chart.update_layout(
+            xaxis_title="Unique Customers",
+            yaxis_title=None,
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(transition_chart, width="stretch")
+
+    detail_view = (
+        detail.sort_values(["target_category", "phone"])
+        .rename(
+            columns={
+                "phone": "Phone",
+                "source_order_id": "Source Order",
+                "source_order_day": "Source Order Date",
+                "source_order_value": "Source Order Value",
+                "target_order_id": "Next Order",
+                "target_order_day": "Next Order Date",
+                "target_order_value": "Next Order Value",
+                "target_category": "Next Order Category",
+                "target_category_revenue": "Category Revenue",
+                "target_category_qty": "Category Qty",
+            }
+        )
+        .head(detail_limit)
+    )
+    st.markdown("**Customer Details**")
+    st.dataframe(
+        detail_view[
+            [
+                "Phone",
+                "Source Order",
+                "Source Order Date",
+                "Source Order Value",
+                "Next Order",
+                "Next Order Date",
+                "Next Order Value",
+                "Next Order Category",
+                "Category Revenue",
+                "Category Qty",
+            ]
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+
+
 def build_customer_churn_profile(
     sales_frame: pd.DataFrame,
     item_frame: pd.DataFrame,
@@ -2379,6 +2655,7 @@ page_options = [
     "Revenue vs Last Month",
     "Product Penetration",
     "Persona",
+    "Category Journey",
     "Churn Dashboard",
     "Monthly Wallet",
     "Customer Count Branch Wise",
@@ -3209,6 +3486,22 @@ if selected_page == "Persona":
                             width="stretch",
                             hide_index=True,
                         )
+
+if selected_page == "Category Journey":
+    st.subheader("Category Journey")
+    st.caption(
+        "Select a category from one order number to see where those customers move in the next order."
+    )
+    journey_source = branch_filtered_df.copy()
+    order_sequence = build_customer_order_sequence(journey_source)
+    if order_sequence.empty:
+        st.info("No non-walkin order sequence found for the selected branch/type filters.")
+    else:
+        journey_tab_12, journey_tab_23 = st.tabs(["1st to 2nd Order", "2nd to 3rd Order"])
+        with journey_tab_12:
+            render_category_transition_view(order_sequence, 1, 2, "journey_1_to_2")
+        with journey_tab_23:
+            render_category_transition_view(order_sequence, 2, 3, "journey_2_to_3")
 
 if selected_page == "Churn Dashboard":
     deep_churn_analysis = st.checkbox(
