@@ -655,7 +655,7 @@ def build_dimension_transition_tables(
     target_dimensions: pd.DataFrame,
     from_rank: int,
     to_rank: int,
-    selected_value: str,
+    selected_values: List[str],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if order_sequence.empty or source_dimensions.empty or target_dimensions.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -666,7 +666,7 @@ def build_dimension_transition_tables(
         return pd.DataFrame(), pd.DataFrame()
 
     source = from_orders.merge(source_dimensions, on="sales_no", how="inner")
-    source = source[source["dimension_value"] == selected_value].copy()
+    source = source[source["dimension_value"].isin(selected_values)].copy()
     if source.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -739,9 +739,10 @@ def render_dimension_transition_view(
         return
 
     filter_col, limit_col = st.columns([1.2, 0.5])
-    selected_value = filter_col.selectbox(
+    selected_values = filter_col.multiselect(
         f"{from_label} order {dimension_label.lower()}",
         value_options,
+        default=value_options[:1],
         key=f"{key_prefix}_source_value",
     )
     detail_limit = int(
@@ -754,6 +755,9 @@ def render_dimension_transition_view(
             key=f"{key_prefix}_detail_limit",
         )
     )
+    if not selected_values:
+        st.info(f"Select at least one {dimension_label.lower()} to see customer transition.")
+        return
 
     summary, detail = build_dimension_transition_tables(
         order_sequence,
@@ -761,18 +765,21 @@ def render_dimension_transition_view(
         target_dimensions,
         from_rank,
         to_rank,
-        selected_value,
+        selected_values,
     )
 
     source_customer_count = int(
         source_orders.merge(
-            source_dimensions[source_dimensions["dimension_value"] == selected_value][["sales_no"]],
+            source_dimensions[source_dimensions["dimension_value"].isin(selected_values)][["sales_no"]],
             on="sales_no",
             how="inner",
         )["phone"].nunique()
     )
     transitioned_customer_count = 0 if detail.empty else int(detail["phone"].nunique())
     transition_rate = 0.0 if source_customer_count == 0 else transitioned_customer_count / source_customer_count * 100
+    selected_display = ", ".join(selected_values[:3])
+    if len(selected_values) > 3:
+        selected_display += f" +{len(selected_values) - 3} more"
 
     metric_cols = st.columns(4)
     metric_cols[0].metric("Source Customers", f"{source_customer_count:,}")
@@ -784,7 +791,7 @@ def render_dimension_transition_view(
         st.markdown(
             "\n".join(
                 [
-                    f"- `Source Customers`: unique phone numbers whose `{from_label}` order contains `{selected_value}`.",
+                    f"- `Source Customers`: unique phone numbers whose `{from_label}` order contains any of `{selected_display}`.",
                     f"- `Next Order Customers`: source customers who also have a `{to_label}` order in the selected filters.",
                     "- `Transition Rate`: `Next Order Customers / Source Customers x 100`.",
                     f"- `Next {dimension_label}s`: distinct {dimension_label.lower()}s bought in the `{to_label}` order by those source customers.",
@@ -794,7 +801,7 @@ def render_dimension_transition_view(
         )
 
     if summary.empty:
-        st.info(f"No next-order {dimension_label.lower()} movement found for the selected {dimension_label.lower()}.")
+        st.info(f"No next-order {dimension_label.lower()} movement found for the selected {dimension_label.lower()} values.")
         return
 
     top_left, top_right = st.columns([1.1, 1.2])
