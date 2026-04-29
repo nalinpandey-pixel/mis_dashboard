@@ -663,6 +663,8 @@ def render_category_transition_view(
     to_rank: int,
     key_prefix: str,
 ) -> None:
+    from_label = "1st" if from_rank == 1 else "2nd" if from_rank == 2 else f"{from_rank}th"
+    to_label = "2nd" if to_rank == 2 else "3rd" if to_rank == 3 else f"{to_rank}th"
     source_orders = order_sequence[order_sequence["order_rank"] == from_rank].copy()
     target_orders = order_sequence[order_sequence["order_rank"] == to_rank].copy()
     if source_orders.empty or target_orders.empty:
@@ -726,6 +728,19 @@ def render_category_transition_view(
     metric_cols[1].metric("Next Order Customers", f"{transitioned_customer_count:,}")
     metric_cols[2].metric("Transition Rate", f"{transition_rate:.2f}%")
     metric_cols[3].metric("Next Categories", f"{0 if summary.empty else summary['target_category'].nunique():,}")
+
+    with st.expander("Definitions", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    f"- `Source Customers`: unique phone numbers whose `{from_label}` order contains `{selected_category}`.",
+                    f"- `Next Order Customers`: source customers who also have a `{to_label}` order in the selected filters.",
+                    "- `Transition Rate`: `Next Order Customers / Source Customers x 100`.",
+                    f"- `Next Categories`: distinct categories bought in the `{to_label}` order by those source customers.",
+                    "- `Next Order Category Mix`: category-wise split of what those customers bought in the next order.",
+                ]
+            )
+        )
 
     if summary.empty:
         st.info("No next-order category movement found for the selected category.")
