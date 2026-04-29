@@ -1,5 +1,7 @@
 ﻿import sqlite3
 import subprocess
+import hmac
+import os
 import sys
 from pathlib import Path
 from datetime import date, timedelta
@@ -23,6 +25,7 @@ APP_DIR = Path(__file__).resolve().parent
 SUPABASE_FETCH_PAGE_SIZE = 1000
 SUPABASE_SALES_RAW_TABLE = "sales_raw_backup"
 SUPABASE_HISTORY_TABLE = "sales_items_history_backup"
+DASHBOARD_PASSWORD_KEYS = ("DASHBOARD_ACCESS_PASSWORD", "DASHBOARD_PASSWORD", "APP_PASSWORD")
 
 
 B2B_BRANCHES = {"b2b noida", "b2b gurgaon"}
@@ -32,6 +35,50 @@ GIFT_MILESTONES = [
     ("Gift 3", "Napkin Holder", "5000_tag", 5000),
     ("Gift 4", "Atta Maker", "10000_tag", 10000),
 ]
+
+
+def get_secret_value(key: str) -> str:
+    value = os.getenv(key)
+    if value:
+        return str(value)
+    try:
+        return str(st.secrets.get(key, ""))
+    except Exception:
+        return ""
+
+
+def get_dashboard_password() -> str:
+    for key in DASHBOARD_PASSWORD_KEYS:
+        value = get_secret_value(key).strip()
+        if value:
+            return value
+    return ""
+
+
+def require_dashboard_login() -> None:
+    expected_password = get_dashboard_password()
+    if not expected_password:
+        st.error(
+            "Dashboard lock is not configured. Add DASHBOARD_ACCESS_PASSWORD in Railway Variables."
+        )
+        st.stop()
+
+    if st.session_state.get("dashboard_authenticated"):
+        return
+
+    st.title("MIS Reporting Dashboard")
+    st.subheader("Dashboard Locked")
+    with st.form("dashboard_login_form"):
+        entered_password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Unlock", width="stretch")
+
+    if submitted:
+        if hmac.compare_digest(str(entered_password), expected_password):
+            st.session_state.dashboard_authenticated = True
+            st.rerun()
+        st.error("Incorrect password.")
+
+    st.stop()
 
 
 def normalize_branch(value: str) -> str:
@@ -2498,6 +2545,7 @@ def apply_quick_range(choice: str, today_value: date) -> Tuple[date, date]:
 
 
 st.set_page_config(page_title="MIS Reporting Dashboard", layout="wide")
+require_dashboard_login()
 st.title("MIS Reporting Dashboard")
 st.caption("Live historical + latest cleaned sales from Supabase")
 
