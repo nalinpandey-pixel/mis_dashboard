@@ -3507,7 +3507,7 @@ if selected_page == "Category Journey":
     st.caption(
         "Select a category from one order number to see where those customers move in the next order."
     )
-    journey_source = branch_filtered_df.copy()
+    journey_source = filtered_df.copy()
     order_sequence = build_customer_order_sequence(journey_source)
     if order_sequence.empty:
         st.info("No non-walkin order sequence found for the selected branch/type filters.")
