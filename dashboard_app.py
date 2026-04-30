@@ -3442,9 +3442,17 @@ if selected_page == "Persona":
         "and personalized product follow-up suggestions."
     )
 
-    input_col, number_col = st.columns([1.2, 0.6])
+    input_col, month_col, number_col = st.columns([1.1, 0.7, 0.5])
     with input_col:
         persona_phone = st.text_input("Phone Number", placeholder="Enter customer phone number")
+    persona_month_options = ["All Months", "This Month", "Last Month"] + recent_months["year_month_label"].tolist()
+    with month_col:
+        selected_persona_month = st.selectbox(
+            "Month",
+            persona_month_options,
+            index=1 if "This Month" in persona_month_options else 0,
+            key="persona_month_filter",
+        )
     with number_col:
         recommendation_limit = st.number_input(
             "Products to show",
@@ -3463,9 +3471,34 @@ if selected_page == "Persona":
             st.warning("No customer history found for that phone number in the filtered data.")
         else:
             customer_frame = persona_source.copy()
+            persona_period_label = "All Months"
+            if selected_persona_month != "All Months":
+                if selected_persona_month == "This Month":
+                    persona_month_start = pd.Timestamp(today_value.replace(day=1))
+                    persona_month_end = pd.Timestamp(min(today_value, default_end))
+                    persona_period_label = persona_month_start.strftime("%Y %B")
+                elif selected_persona_month == "Last Month":
+                    this_month_start = pd.Timestamp(today_value.replace(day=1))
+                    persona_month_start = this_month_start - pd.offsets.MonthBegin(1)
+                    persona_month_end = persona_month_start + pd.offsets.MonthEnd(0)
+                    persona_period_label = persona_month_start.strftime("%Y %B")
+                else:
+                    selected_persona_row = recent_months[
+                        recent_months["year_month_label"] == selected_persona_month
+                    ].iloc[0]
+                    persona_month_start = selected_persona_row["sales_month"]
+                    persona_month_end = persona_month_start + pd.offsets.MonthEnd(0)
+                    persona_period_label = selected_persona_month
+
+                customer_frame = customer_frame[
+                    (customer_frame["sales_day"] >= persona_month_start.normalize())
+                    & (customer_frame["sales_day"] <= persona_month_end.normalize())
+                ].copy()
+
             if customer_frame.empty:
-                st.warning("No customer history found for that phone number in the filtered data.")
+                st.warning("No customer history found for that phone number in the selected month.")
             else:
+                st.caption(f"Persona period: {persona_period_label}")
                 product_mix = build_persona_product_mix(customer_frame)
                 repeat_profile = build_persona_repeat_profile(customer_frame)
                 recommendations = build_persona_recommendations(customer_frame, int(recommendation_limit))
