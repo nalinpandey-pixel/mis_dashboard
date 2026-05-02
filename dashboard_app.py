@@ -2499,22 +2499,31 @@ def render_tag_change_summary(summary_df: pd.DataFrame, current_label: str, prev
     st.dataframe(summary_df, width="stretch", hide_index=True)
 
 
+def normalize_display_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    display_frame = frame.copy()
+    display_frame.columns = [str(column) for column in display_frame.columns]
+    return display_frame
+
+
 def style_count_matrix(frame: pd.DataFrame):
     if frame.empty:
         return frame
-    return frame.style.background_gradient(cmap="Greens").format(precision=0)
+    display_frame = normalize_display_columns(frame)
+    return display_frame.style.background_gradient(cmap="Greens").format(precision=0)
 
 
 def style_currency_matrix(frame: pd.DataFrame):
     if frame.empty:
         return frame
-    return frame.style.background_gradient(cmap="Greens").format("{:,.2f}")
+    display_frame = normalize_display_columns(frame)
+    return display_frame.style.background_gradient(cmap="Greens").format("{:,.2f}")
 
 
 def style_percentage_matrix(frame: pd.DataFrame):
     if frame.empty:
         return frame
-    return frame.style.background_gradient(cmap="Greens").format("{:.0%}")
+    display_frame = normalize_display_columns(frame)
+    return display_frame.style.background_gradient(cmap="Greens").format("{:.0%}")
 
 
 def start_of_week(day_value: date) -> date:
@@ -2621,6 +2630,8 @@ if "from_date_input" not in st.session_state:
     st.session_state.from_date_input = st.session_state.filter_from
 if "to_date_input" not in st.session_state:
     st.session_state.to_date_input = st.session_state.filter_to
+st.session_state.from_date_input = max(min(st.session_state.from_date_input, default_end), default_start)
+st.session_state.to_date_input = max(min(st.session_state.to_date_input, default_end), default_start)
 
 quick_cols = st.columns(6)
 for col, label in zip(
@@ -2667,14 +2678,12 @@ st.session_state.month_filter = selected_month_option
 
 start_date = filter_cols[1].date_input(
     "From",
-    value=st.session_state.from_date_input,
     min_value=default_start,
     max_value=default_end,
     key="from_date_input",
 )
 end_date = filter_cols[2].date_input(
     "To",
-    value=st.session_state.to_date_input,
     min_value=default_start,
     max_value=default_end,
     key="to_date_input",
