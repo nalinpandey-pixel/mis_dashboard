@@ -49,6 +49,8 @@ SALES_RAW_COLUMNS = {
     "order_type",
 }
 FETCH_PAGE_SIZE = 1000
+MAX_SUPABASE_IN_FILTER_VALUES = 50
+MAX_SUPABASE_IN_FILTER_CHARS = 2500
 SYNC_LOOKBACK_MINUTES = 10
 UNWANTED_NAMES = [
     "Anmasa Noida",
@@ -1178,6 +1180,31 @@ def build_supabase_in_filter(values: List[Any]) -> str:
     return "(" + ",".join(supabase_quote_literal(value) for value in values) + ")"
 
 
+def iter_supabase_in_filter_batches(values: List[Any]) -> List[List[Any]]:
+    batches: List[List[Any]] = []
+    current_batch: List[Any] = []
+    current_length = 2
+    for value in values:
+        literal = supabase_quote_literal(value)
+        additional_length = len(literal) + (1 if current_batch else 0)
+        if (
+            current_batch
+            and (
+                len(current_batch) >= MAX_SUPABASE_IN_FILTER_VALUES
+                or current_length + additional_length > MAX_SUPABASE_IN_FILTER_CHARS
+            )
+        ):
+            batches.append(current_batch)
+            current_batch = []
+            current_length = 2
+            additional_length = len(literal)
+        current_batch.append(value)
+        current_length += additional_length
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
 def delete_remote_rows(
     config: SupabaseConfig,
     table_name: str,
@@ -1311,8 +1338,7 @@ def delete_remote_sales_raw_conflicts(
     if not sales_nos:
         return
 
-    for index in range(0, len(sales_nos), FETCH_PAGE_SIZE):
-        batch = sales_nos[index : index + FETCH_PAGE_SIZE]
+    for batch in iter_supabase_in_filter_batches(sales_nos):
         delete_remote_rows(
             config,
             table_name,
@@ -1336,8 +1362,7 @@ def delete_remote_rows_by_key(
     if not values:
         return
 
-    for index in range(0, len(values), FETCH_PAGE_SIZE):
-        batch = values[index : index + FETCH_PAGE_SIZE]
+    for batch in iter_supabase_in_filter_batches(values):
         delete_remote_rows(
             config,
             table_name,
@@ -1767,9 +1792,7 @@ def persist_to_target_supabase(
     historical_seed_payload = prepare_remote_historical_seed_rows(historical_seed_df) if historical_seed_df is not None else []
 
     post_remote_rows(config, cleaned_table, cleaned_payload, upsert=True, on_conflict="record_id")
-    if removed_payload:
-        delete_remote_rows_by_key(config, removed_table, removed_payload, "removed_id")
-    post_remote_rows(config, removed_table, removed_payload, upsert=False)
+    post_remote_rows(config, removed_table, removed_payload, upsert=True, on_conflict="removed_id")
     if full_refresh and historical_seed_payload:
         post_remote_rows(config, sales_raw_table, historical_seed_payload, upsert=False)
     elif sales_raw_payload:
