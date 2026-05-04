@@ -1,6 +1,7 @@
 ﻿import sqlite3
 import subprocess
 import hmac
+import json
 import os
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ from sales_pipeline import (
 
 
 APP_DIR = Path(__file__).resolve().parent
+REWARD_PRODUCT_MAPPING_FILE = APP_DIR / "reward_product_mapping.json"
 SUPABASE_FETCH_PAGE_SIZE = 1000
 SUPABASE_SALES_RAW_TABLE = "sales_raw_backup"
 SUPABASE_HISTORY_TABLE = "sales_items_history_backup"
@@ -35,6 +37,57 @@ GIFT_MILESTONES = [
     ("Gift 3", "Napkin Holder", "5000_tag", 5000),
     ("Gift 4", "Atta Maker", "10000_tag", 10000),
 ]
+DEFAULT_REWARD_PRODUCT_NAMES = {tag_name: gift_name for _, gift_name, tag_name, _ in GIFT_MILESTONES}
+
+
+def normalize_reward_product_names(values: object) -> Dict[str, str]:
+    names = DEFAULT_REWARD_PRODUCT_NAMES.copy()
+    if isinstance(values, dict):
+        for tag_name in DEFAULT_REWARD_PRODUCT_NAMES:
+            value = values.get(tag_name, "")
+            if str(value).strip():
+                names[tag_name] = str(value).strip()
+    return names
+
+
+def load_reward_product_mapping_config() -> Dict[str, object]:
+    default_config: Dict[str, object] = {
+        "use_fixed_mapping": True,
+        "fixed_product_names": DEFAULT_REWARD_PRODUCT_NAMES.copy(),
+        "monthly_product_names": {},
+    }
+    if not REWARD_PRODUCT_MAPPING_FILE.exists():
+        return default_config
+
+    try:
+        raw_config = json.loads(REWARD_PRODUCT_MAPPING_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_config
+
+    if not isinstance(raw_config, dict):
+        return default_config
+
+    monthly_names: Dict[str, Dict[str, str]] = {}
+    raw_monthly_names = raw_config.get("monthly_product_names", {})
+    if isinstance(raw_monthly_names, dict):
+        for month_key, product_names in raw_monthly_names.items():
+            monthly_names[str(month_key)] = normalize_reward_product_names(product_names)
+
+    return {
+        "use_fixed_mapping": bool(raw_config.get("use_fixed_mapping", True)),
+        "fixed_product_names": normalize_reward_product_names(raw_config.get("fixed_product_names", {})),
+        "monthly_product_names": monthly_names,
+    }
+
+
+def save_reward_product_mapping_config(config: Dict[str, object]) -> None:
+    try:
+        REWARD_PRODUCT_MAPPING_FILE.write_text(
+            json.dumps(config, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError:
+        st.warning("Reward product mapping could not be saved on this server.")
 
 
 def get_secret_value(key: str) -> str:
@@ -4313,18 +4366,52 @@ if selected_page == "Tags":
 
         st.markdown("**Reward product mapping for redemption**")
         st.caption(
-            "Enter the exact reward product name used in sales items for this selected month. "
+            "Enter the exact reward product name used in sales items. "
             "Redemption is counted when an eligible customer's order contains that product name."
         )
+        month_key = selected_tag_month.strftime("%Y_%m")
+        reward_mapping_config = load_reward_product_mapping_config()
+        use_fixed_reward_mapping = st.toggle(
+            "Use same product names for every month",
+            value=bool(reward_mapping_config.get("use_fixed_mapping", True)),
+            key="use_fixed_reward_product_mapping",
+            help="Turn this on to keep one reward product mapping across all Tags months.",
+        )
+        monthly_reward_names = reward_mapping_config.get("monthly_product_names", {})
+        if not isinstance(monthly_reward_names, dict):
+            monthly_reward_names = {}
+        saved_reward_product_names = (
+            reward_mapping_config.get("fixed_product_names", {})
+            if use_fixed_reward_mapping
+            else monthly_reward_names.get(month_key, {})
+        )
+        saved_reward_product_names = normalize_reward_product_names(saved_reward_product_names)
         reward_product_names: Dict[str, str] = {}
         reward_cols = st.columns(4)
         for idx, (gift_label, default_gift_name, tag_name, milestone) in enumerate(GIFT_MILESTONES):
             reward_product_names[tag_name] = reward_cols[idx].text_input(
                 f"{tag_name} product",
-                value=default_gift_name,
-                key=f"reward_product_{selected_tag_month.strftime('%Y_%m')}_{tag_name}",
+                value=saved_reward_product_names.get(tag_name, default_gift_name),
+                key=(
+                    f"reward_product_fixed_{tag_name}"
+                    if use_fixed_reward_mapping
+                    else f"reward_product_{month_key}_{tag_name}"
+                ),
                 help=f"Reward product name for {gift_label} / spend >= {milestone:,}.",
             )
+        updated_reward_mapping_config = {
+            "use_fixed_mapping": use_fixed_reward_mapping,
+            "fixed_product_names": (
+                reward_product_names.copy()
+                if use_fixed_reward_mapping
+                else normalize_reward_product_names(reward_mapping_config.get("fixed_product_names", {}))
+            ),
+            "monthly_product_names": dict(monthly_reward_names),
+        }
+        if not use_fixed_reward_mapping:
+            updated_reward_mapping_config["monthly_product_names"][month_key] = reward_product_names.copy()
+        if updated_reward_mapping_config != reward_mapping_config:
+            save_reward_product_mapping_config(updated_reward_mapping_config)
 
         tags_dashboard, tags_chart, tags_redemption, tags_below, tags_inventory, tags_daily, tags_comparison = st.tabs(
             ["Dashboard", "Chart", "Redemption", "Below1000", "Inventory", "Daily Tags", "Comparison"]
