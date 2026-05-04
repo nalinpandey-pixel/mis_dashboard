@@ -633,6 +633,49 @@ def load_order_item_rows(order_ids: Tuple[str, ...]) -> pd.DataFrame:
     return frame
 
 
+@st.cache_data(ttl=600, max_entries=8)
+def load_order_reward_item_rows(order_ids: Tuple[str, ...], reward_product_names: Tuple[str, ...]) -> pd.DataFrame:
+    cleaned_order_ids = [
+        order_id.strip()
+        for order_id in order_ids
+        if str(order_id).strip() and str(order_id).strip().lower() not in {"none", "nan"}
+    ]
+    cleaned_reward_names = [
+        product_name.strip()
+        for product_name in reward_product_names
+        if str(product_name).strip() and str(product_name).strip().lower() not in {"none", "nan"}
+    ]
+    if not cleaned_order_ids or not cleaned_reward_names:
+        return pd.DataFrame(columns=["sales_no", "mob_no", "product_name", "net_amount", "qty"])
+
+    frames: List[pd.DataFrame] = []
+    reward_filter = f"in.{build_supabase_in_filter(cleaned_reward_names)}"
+    for start_idx in range(0, len(cleaned_order_ids), 150):
+        batch = cleaned_order_ids[start_idx : start_idx + 150]
+        batch_frame = load_supabase_table(
+            SUPABASE_HISTORY_TABLE,
+            select_columns="sales_no,mob_no,product_name,net_amount,qty",
+            filters={
+                "sales_no": f"in.{build_supabase_in_filter(batch)}",
+                "product_name": reward_filter,
+            },
+            order_column=None,
+        )
+        if not batch_frame.empty:
+            frames.append(batch_frame)
+
+    if not frames:
+        return pd.DataFrame(columns=["sales_no", "mob_no", "product_name", "net_amount", "qty"])
+
+    frame = pd.concat(frames, ignore_index=True)
+    frame["sales_no"] = frame["sales_no"].fillna("").astype(str).str.strip()
+    frame["mob_no"] = frame["mob_no"].fillna("").astype(str).str.strip()
+    frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
+    frame["net_amount"] = pd.to_numeric(frame["net_amount"], errors="coerce").fillna(0.0)
+    frame["qty"] = pd.to_numeric(frame["qty"], errors="coerce").fillna(0.0)
+    return frame
+
+
 def prepare_order_dimension_set(item_rows: pd.DataFrame, dimension_column: str) -> pd.DataFrame:
     if item_rows.empty:
         return pd.DataFrame(columns=["sales_no", "dimension_value", "dimension_revenue", "dimension_qty"])
@@ -2173,6 +2216,98 @@ def build_tags_inventory(frame: pd.DataFrame, month_value: pd.Timestamp, cutoff_
             }
         )
     return pd.DataFrame(rows)
+
+
+def build_tags_reward_redemption(
+    spend_frame: pd.DataFrame,
+    item_rows: pd.DataFrame,
+    reward_product_names: Dict[str, str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if spend_frame.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    item_frame = item_rows.copy()
+    if not item_frame.empty:
+        item_frame["mob_no"] = item_frame["mob_no"].fillna("").astype(str).str.strip()
+        item_frame["product_name"] = item_frame["product_name"].fillna("").astype(str).str.strip()
+        item_frame["product_match_key"] = item_frame["product_name"].str.casefold()
+
+    summary_rows: List[Dict[str, object]] = []
+    detail_rows: List[pd.DataFrame] = []
+    spend_lookup = spend_frame[["Phone", "Spend"]].copy()
+
+    for gift_label, gift_name, tag_name, milestone in GIFT_MILESTONES:
+        reward_product_name = str(reward_product_names.get(tag_name, "") or "").strip()
+        eligible = spend_frame[spend_frame["Spend"] >= milestone][["Phone", "Spend"]].copy()
+        eligible_customers = int(eligible["Phone"].nunique())
+        redeemed = pd.DataFrame(columns=["Phone", "Redeemed Qty", "Redeemed Value", "Redeemed Orders"])
+
+        if reward_product_name and eligible_customers and not item_frame.empty:
+            reward_key = reward_product_name.casefold()
+            redeemed_items = item_frame[
+                item_frame["product_match_key"].eq(reward_key)
+                & item_frame["mob_no"].isin(eligible["Phone"])
+            ].copy()
+            if not redeemed_items.empty:
+                redeemed = (
+                    redeemed_items.groupby("mob_no", as_index=False)
+                    .agg(
+                        **{
+                            "Redeemed Qty": ("qty", "sum"),
+                            "Redeemed Value": ("net_amount", "sum"),
+                            "Redeemed Orders": ("sales_no", "nunique"),
+                        }
+                    )
+                    .rename(columns={"mob_no": "Phone"})
+                )
+
+        detail = eligible.merge(redeemed, on="Phone", how="left")
+        detail["Reward Status"] = detail["Redeemed Orders"].fillna(0).gt(0).map(
+            {True: "Redeemed", False: "Pending"}
+        )
+        detail["Redeemed Qty"] = detail["Redeemed Qty"].fillna(0).round(2)
+        detail["Redeemed Value"] = detail["Redeemed Value"].fillna(0).round(2)
+        detail["Redeemed Orders"] = detail["Redeemed Orders"].fillna(0).astype(int)
+        detail["Gift"] = gift_label
+        detail["Milestone Tag"] = tag_name
+        detail["Reward Product Name"] = reward_product_name or "Not mapped"
+        detail_rows.append(
+            detail[
+                [
+                    "Gift",
+                    "Milestone Tag",
+                    "Reward Product Name",
+                    "Phone",
+                    "Spend",
+                    "Reward Status",
+                    "Redeemed Qty",
+                    "Redeemed Value",
+                    "Redeemed Orders",
+                ]
+            ]
+        )
+
+        redeemed_customers = int(detail["Reward Status"].eq("Redeemed").sum())
+        pending_customers = max(eligible_customers - redeemed_customers, 0)
+        redemption_rate = 0.0 if eligible_customers == 0 else redeemed_customers / eligible_customers * 100
+        summary_rows.append(
+            {
+                "Gift": gift_label,
+                "Gift Name": gift_name,
+                "Milestone Tag": tag_name,
+                "Milestone Spend": milestone,
+                "Reward Product Name": reward_product_name or "Not mapped",
+                "Eligible Customers": eligible_customers,
+                "Redeemed Customers": redeemed_customers,
+                "Pending Customers": pending_customers,
+                "Redemption Rate %": round(redemption_rate, 2),
+            }
+        )
+
+    detail_frame = pd.concat(detail_rows, ignore_index=True) if detail_rows else pd.DataFrame()
+    if not detail_frame.empty:
+        detail_frame = detail_frame.merge(spend_lookup, on=["Phone", "Spend"], how="left")
+    return pd.DataFrame(summary_rows), detail_frame
 
 
 def build_tags_below_1000(frame: pd.DataFrame, month_value: pd.Timestamp, cutoff_day: pd.Timestamp = None) -> pd.DataFrame:
@@ -4176,8 +4311,23 @@ if selected_page == "Tags":
             )
             previous_day_cutoff = previous_tag_month + pd.Timedelta(days=previous_day_number - 1)
 
-        tags_dashboard, tags_chart, tags_below, tags_inventory, tags_daily, tags_comparison = st.tabs(
-            ["Dashboard", "Chart", "Below1000", "Inventory", "Daily Tags", "Comparison"]
+        st.markdown("**Reward product mapping for redemption**")
+        st.caption(
+            "Enter the exact reward product name used in sales items for this selected month. "
+            "Redemption is counted when an eligible customer's order contains that product name."
+        )
+        reward_product_names: Dict[str, str] = {}
+        reward_cols = st.columns(4)
+        for idx, (gift_label, default_gift_name, tag_name, milestone) in enumerate(GIFT_MILESTONES):
+            reward_product_names[tag_name] = reward_cols[idx].text_input(
+                f"{tag_name} product",
+                value=default_gift_name,
+                key=f"reward_product_{selected_tag_month.strftime('%Y_%m')}_{tag_name}",
+                help=f"Reward product name for {gift_label} / spend >= {milestone:,}.",
+            )
+
+        tags_dashboard, tags_chart, tags_redemption, tags_below, tags_inventory, tags_daily, tags_comparison = st.tabs(
+            ["Dashboard", "Chart", "Redemption", "Below1000", "Inventory", "Daily Tags", "Comparison"]
         )
 
         tag_spend = build_tags_customer_spend(tags_source, selected_tag_month, cutoff_day=selected_day_cutoff)
@@ -4219,6 +4369,27 @@ if selected_page == "Tags":
             previous_tag_month,
             cutoff_day=previous_day_cutoff,
         )
+        tag_month_orders = tags_source[
+            (tags_source["sales_month"] == selected_tag_month)
+            & (tags_source["nonwalkin"] == 1)
+            & (~tags_source["is_b2b"])
+        ].copy()
+        if selected_day_cutoff is not None:
+            tag_month_orders = tag_month_orders[tag_month_orders["sales_day"] <= selected_day_cutoff]
+        tag_order_ids = tuple(sorted(tag_month_orders["order_id"].dropna().astype(str).str.strip().unique().tolist()))
+        mapped_reward_names = tuple(
+            sorted({str(product_name).strip() for product_name in reward_product_names.values() if str(product_name).strip()})
+        )
+        tag_item_rows = (
+            load_order_reward_item_rows(tag_order_ids, mapped_reward_names)
+            if tag_order_ids and mapped_reward_names
+            else pd.DataFrame()
+        )
+        tag_redemption_summary, tag_redemption_detail = build_tags_reward_redemption(
+            tag_spend,
+            tag_item_rows,
+            reward_product_names,
+        )
 
         with tags_dashboard:
             st.subheader("Customer Spend Tags Dashboard")
@@ -4255,6 +4426,42 @@ if selected_page == "Tags":
                 else:
                     split_chart = px.pie(split_source, names="label", values="value")
                     st.plotly_chart(split_chart, width="stretch")
+
+        with tags_redemption:
+            st.subheader("Reward Redemption")
+            st.caption(
+                "`Eligible Customers` means customers who reached that spend milestone. "
+                "`Redeemed Customers` means eligible customers whose item-level order contains the mapped reward product name."
+            )
+            if tag_redemption_summary.empty:
+                st.info("No redemption rows found for the selected month.")
+            else:
+                st.dataframe(tag_redemption_summary, width="stretch", hide_index=True)
+                detail_filter_cols = st.columns([1.0, 1.0, 2.0])
+                selected_reward_tag = detail_filter_cols[0].selectbox(
+                    "Reward tag",
+                    ["All Tags"] + [tag_name for _, _, tag_name, _ in GIFT_MILESTONES],
+                    key=f"redemption_reward_tag_{selected_tag_month.strftime('%Y_%m')}",
+                )
+                selected_reward_status = detail_filter_cols[1].selectbox(
+                    "Reward status",
+                    ["All", "Redeemed", "Pending"],
+                    key=f"redemption_reward_status_{selected_tag_month.strftime('%Y_%m')}",
+                )
+                detail_view = tag_redemption_detail.copy()
+                if selected_reward_tag != "All Tags":
+                    detail_view = detail_view[detail_view["Milestone Tag"] == selected_reward_tag]
+                if selected_reward_status != "All":
+                    detail_view = detail_view[detail_view["Reward Status"] == selected_reward_status]
+                detail_filter_cols[2].metric("Visible Customers", f"{detail_view['Phone'].nunique() if not detail_view.empty else 0:,}")
+                if detail_view.empty:
+                    st.info("No customer rows found for the selected redemption filter.")
+                else:
+                    st.dataframe(
+                        detail_view.sort_values(["Milestone Tag", "Reward Status", "Spend"], ascending=[True, True, False]),
+                        width="stretch",
+                        hide_index=True,
+                    )
 
         with tags_below:
             st.subheader("Below 1000")
