@@ -1,6 +1,7 @@
 ﻿import sqlite3
 import subprocess
 import hmac
+import json
 import os
 import sys
 from pathlib import Path
@@ -22,6 +23,8 @@ from sales_pipeline import (
 
 
 APP_DIR = Path(__file__).resolve().parent
+REWARD_MAPPING_DIR = Path(os.getenv("APP_DATA_DIR", str(APP_DIR)))
+REWARD_PRODUCT_MAPPING_FILE = REWARD_MAPPING_DIR / "reward_product_mapping.json"
 SUPABASE_FETCH_PAGE_SIZE = 1000
 SUPABASE_SALES_RAW_TABLE = "sales_raw_backup"
 SUPABASE_HISTORY_TABLE = "sales_items_history_backup"
@@ -35,6 +38,58 @@ GIFT_MILESTONES = [
     ("Gift 3", "Napkin Holder", "5000_tag", 5000),
     ("Gift 4", "Atta Maker", "10000_tag", 10000),
 ]
+DEFAULT_REWARD_PRODUCT_NAMES = {tag_name: gift_name for _, gift_name, tag_name, _ in GIFT_MILESTONES}
+
+
+def normalize_reward_product_names(values: object) -> Dict[str, str]:
+    names = DEFAULT_REWARD_PRODUCT_NAMES.copy()
+    if isinstance(values, dict):
+        for tag_name in DEFAULT_REWARD_PRODUCT_NAMES:
+            value = values.get(tag_name)
+            if str(value or "").strip():
+                names[tag_name] = str(value).strip()
+    return names
+
+
+def load_reward_product_mapping_config() -> Dict[str, object]:
+    default_config: Dict[str, object] = {
+        "apply_to_all_months": False,
+        "global_product_names": DEFAULT_REWARD_PRODUCT_NAMES.copy(),
+        "monthly_product_names": {},
+    }
+    if not REWARD_PRODUCT_MAPPING_FILE.exists():
+        return default_config
+
+    try:
+        raw_config = json.loads(REWARD_PRODUCT_MAPPING_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_config
+
+    if not isinstance(raw_config, dict):
+        return default_config
+
+    monthly_names: Dict[str, Dict[str, str]] = {}
+    raw_monthly_names = raw_config.get("monthly_product_names", {})
+    if isinstance(raw_monthly_names, dict):
+        for month_key, product_names in raw_monthly_names.items():
+            monthly_names[str(month_key)] = normalize_reward_product_names(product_names)
+
+    return {
+        "apply_to_all_months": bool(raw_config.get("apply_to_all_months", False)),
+        "global_product_names": normalize_reward_product_names(raw_config.get("global_product_names", {})),
+        "monthly_product_names": monthly_names,
+    }
+
+
+def save_reward_product_mapping_config(config: Dict[str, object]) -> None:
+    try:
+        REWARD_MAPPING_DIR.mkdir(parents=True, exist_ok=True)
+        REWARD_PRODUCT_MAPPING_FILE.write_text(
+            json.dumps(config, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError:
+        st.warning("Reward product mapping could not be saved for everyone.")
 
 
 def get_secret_value(key: str) -> str:
@@ -4313,18 +4368,70 @@ if selected_page == "Tags":
 
         st.markdown("**Reward product mapping for redemption**")
         st.caption(
-            "Enter the exact reward product name used in sales items for this selected month. "
+            "Enter the exact reward product name used in sales items. "
             "Redemption is counted when an eligible customer's order contains that product name."
         )
+        month_key = selected_tag_month.strftime("%Y_%m")
+        reward_mapping_config = load_reward_product_mapping_config()
+        apply_reward_mapping_to_all_months = st.toggle(
+            "Apply these product names to every month",
+            value=bool(reward_mapping_config.get("apply_to_all_months", False)),
+            key="reward_mapping_apply_to_all_months",
+            help="When this is on, the four product names below are used for every Tags month and for everyone using this dashboard.",
+        )
+        previously_applied_to_all_months = st.session_state.get(
+            "_previous_reward_mapping_apply_to_all_months",
+            bool(reward_mapping_config.get("apply_to_all_months", False)),
+        )
+        monthly_reward_product_names = reward_mapping_config.get("monthly_product_names", {})
+        if not isinstance(monthly_reward_product_names, dict):
+            monthly_reward_product_names = {}
+        promote_current_month_mapping = (
+            apply_reward_mapping_to_all_months and not previously_applied_to_all_months
+        )
+        active_reward_product_names = (
+            {
+                tag_name: st.session_state.get(
+                    f"reward_product_{month_key}_{tag_name}",
+                    monthly_reward_product_names.get(month_key, {}).get(tag_name, default_gift_name)
+                    if isinstance(monthly_reward_product_names.get(month_key, {}), dict)
+                    else default_gift_name,
+                )
+                for _, default_gift_name, tag_name, _ in GIFT_MILESTONES
+            }
+            if promote_current_month_mapping
+            else reward_mapping_config.get("global_product_names", {})
+            if apply_reward_mapping_to_all_months
+            else monthly_reward_product_names.get(month_key, {})
+        )
+        active_reward_product_names = normalize_reward_product_names(active_reward_product_names)
         reward_product_names: Dict[str, str] = {}
         reward_cols = st.columns(4)
         for idx, (gift_label, default_gift_name, tag_name, milestone) in enumerate(GIFT_MILESTONES):
             reward_product_names[tag_name] = reward_cols[idx].text_input(
                 f"{tag_name} product",
-                value=default_gift_name,
-                key=f"reward_product_{selected_tag_month.strftime('%Y_%m')}_{tag_name}",
+                value=active_reward_product_names.get(tag_name, default_gift_name),
+                key=(
+                    f"reward_product_global_{tag_name}"
+                    if apply_reward_mapping_to_all_months
+                    else f"reward_product_{month_key}_{tag_name}"
+                ),
                 help=f"Reward product name for {gift_label} / spend >= {milestone:,}.",
             )
+        updated_reward_mapping_config = {
+            "apply_to_all_months": apply_reward_mapping_to_all_months,
+            "global_product_names": (
+                reward_product_names.copy()
+                if apply_reward_mapping_to_all_months
+                else normalize_reward_product_names(reward_mapping_config.get("global_product_names", {}))
+            ),
+            "monthly_product_names": dict(monthly_reward_product_names),
+        }
+        if not apply_reward_mapping_to_all_months:
+            updated_reward_mapping_config["monthly_product_names"][month_key] = reward_product_names.copy()
+        if updated_reward_mapping_config != reward_mapping_config:
+            save_reward_product_mapping_config(updated_reward_mapping_config)
+        st.session_state["_previous_reward_mapping_apply_to_all_months"] = apply_reward_mapping_to_all_months
 
         tags_dashboard, tags_chart, tags_redemption, tags_below, tags_inventory, tags_daily, tags_comparison = st.tabs(
             ["Dashboard", "Chart", "Redemption", "Below1000", "Inventory", "Daily Tags", "Comparison"]
