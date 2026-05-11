@@ -2365,6 +2365,89 @@ def build_tags_reward_redemption(
     return pd.DataFrame(summary_rows), detail_frame
 
 
+def build_tags_reward_defaulters(
+    item_rows: pd.DataFrame,
+    reward_product_names: Dict[str, str],
+    month_value: pd.Timestamp,
+) -> pd.DataFrame:
+    if item_rows.empty:
+        return pd.DataFrame()
+
+    item_frame = item_rows.copy()
+    item_frame["mob_no"] = item_frame["mob_no"].fillna("").astype(str).str.strip()
+    item_frame["sales_no"] = item_frame["sales_no"].fillna("").astype(str).str.strip()
+    item_frame["product_name"] = item_frame["product_name"].fillna("").astype(str).str.strip()
+    item_frame["qty"] = pd.to_numeric(item_frame["qty"], errors="coerce").fillna(0.0)
+    item_frame["product_match_key"] = item_frame["product_name"].str.casefold()
+
+    reward_lookup = []
+    for gift_label, gift_name, tag_name, milestone in GIFT_MILESTONES:
+        reward_product_name = str(reward_product_names.get(tag_name, "") or "").strip()
+        if reward_product_name:
+            reward_lookup.append(
+                {
+                    "product_match_key": reward_product_name.casefold(),
+                    "Gift": gift_label,
+                    "Gift Name": gift_name,
+                    "Milestone Tag": tag_name,
+                    "Milestone Spend": milestone,
+                    "Reward Product Name": reward_product_name,
+                }
+            )
+
+    if not reward_lookup:
+        return pd.DataFrame()
+
+    reward_lookup_frame = pd.DataFrame(reward_lookup)
+    matched = item_frame.merge(reward_lookup_frame, on="product_match_key", how="inner")
+    matched = matched[(matched["mob_no"] != "") & (matched["mob_no"] != WALKIN_PLACEHOLDER)].copy()
+    if matched.empty:
+        return pd.DataFrame()
+
+    def order_list(values: pd.Series) -> str:
+        cleaned = sorted({str(value).strip() for value in values if str(value).strip()})
+        return ", ".join(cleaned)
+
+    grouped = (
+        matched.groupby(
+            ["mob_no", "Gift", "Gift Name", "Milestone Tag", "Milestone Spend", "Reward Product Name"],
+            as_index=False,
+        )
+        .agg(
+            **{
+                "Redeemed Qty": ("qty", "sum"),
+                "Redeemed Orders": ("sales_no", "nunique"),
+                "Order Numbers": ("sales_no", order_list),
+            }
+        )
+        .rename(columns={"mob_no": "Phone"})
+    )
+    grouped = grouped[grouped["Redeemed Qty"] > 1].copy()
+    if grouped.empty:
+        return pd.DataFrame()
+
+    grouped.insert(0, "Month", month_value.strftime("%B %Y"))
+    grouped["Redeemed Qty"] = grouped["Redeemed Qty"].round(2)
+    grouped["Extra Qty"] = (grouped["Redeemed Qty"] - 1).round(2)
+    grouped["Status"] = "Defaulter"
+    return grouped[
+        [
+            "Month",
+            "Status",
+            "Phone",
+            "Gift",
+            "Gift Name",
+            "Milestone Tag",
+            "Milestone Spend",
+            "Reward Product Name",
+            "Redeemed Qty",
+            "Extra Qty",
+            "Redeemed Orders",
+            "Order Numbers",
+        ]
+    ].sort_values(["Redeemed Qty", "Redeemed Orders", "Phone"], ascending=[False, False, True])
+
+
 def build_tags_below_1000(frame: pd.DataFrame, month_value: pd.Timestamp, cutoff_day: pd.Timestamp = None) -> pd.DataFrame:
     spend_frame = build_tags_customer_spend(frame, month_value, cutoff_day=cutoff_day)
     if spend_frame.empty:
@@ -4433,8 +4516,8 @@ if selected_page == "Tags":
             save_reward_product_mapping_config(updated_reward_mapping_config)
         st.session_state["_previous_reward_mapping_apply_to_all_months"] = apply_reward_mapping_to_all_months
 
-        tags_dashboard, tags_chart, tags_redemption, tags_below, tags_inventory, tags_daily, tags_comparison = st.tabs(
-            ["Dashboard", "Chart", "Redemption", "Below1000", "Inventory", "Daily Tags", "Comparison"]
+        tags_dashboard, tags_chart, tags_redemption, tags_defaulters, tags_below, tags_inventory, tags_daily, tags_comparison = st.tabs(
+            ["Dashboard", "Chart", "Redemption", "Defaulter", "Below1000", "Inventory", "Daily Tags", "Comparison"]
         )
 
         tag_spend = build_tags_customer_spend(tags_source, selected_tag_month, cutoff_day=selected_day_cutoff)
@@ -4496,6 +4579,11 @@ if selected_page == "Tags":
             tag_spend,
             tag_item_rows,
             reward_product_names,
+        )
+        tag_reward_defaulters = build_tags_reward_defaulters(
+            tag_item_rows,
+            reward_product_names,
+            selected_tag_month,
         )
 
         with tags_dashboard:
@@ -4569,6 +4657,80 @@ if selected_page == "Tags":
                         width="stretch",
                         hide_index=True,
                     )
+
+        with tags_defaulters:
+            st.subheader("Reward Defaulter Customers")
+            st.caption(
+                "A customer is marked defaulter when the redeemed quantity for the same mapped gift product is more than 1 in the selected month."
+            )
+            defaulter_month_options = available_tag_months["year_month_label"].tolist()
+            selected_defaulter_month_label = st.selectbox(
+                "Month Year",
+                defaulter_month_options,
+                index=defaulter_month_options.index(selected_tag_month_label),
+                key="tag_defaulter_month_filter",
+            )
+            defaulter_month = available_tag_months.loc[
+                available_tag_months["year_month_label"] == selected_defaulter_month_label, "sales_month"
+            ].iloc[0]
+            if selected_defaulter_month_label == selected_tag_month_label:
+                defaulter_rows = tag_reward_defaulters
+            else:
+                defaulter_month_key = defaulter_month.strftime("%Y_%m")
+                defaulter_reward_names = (
+                    normalize_reward_product_names(updated_reward_mapping_config.get("global_product_names", {}))
+                    if apply_reward_mapping_to_all_months
+                    else normalize_reward_product_names(
+                        updated_reward_mapping_config.get("monthly_product_names", {}).get(defaulter_month_key, {})
+                    )
+                )
+                defaulter_orders = tags_source[
+                    (tags_source["sales_month"] == defaulter_month)
+                    & (tags_source["nonwalkin"] == 1)
+                    & (~tags_source["is_b2b"])
+                ].copy()
+                defaulter_order_ids = tuple(
+                    sorted(defaulter_orders["order_id"].dropna().astype(str).str.strip().unique().tolist())
+                )
+                defaulter_reward_product_names = tuple(
+                    sorted(
+                        {
+                            str(product_name).strip()
+                            for product_name in defaulter_reward_names.values()
+                            if str(product_name).strip()
+                        }
+                    )
+                )
+                defaulter_item_rows = (
+                    load_order_reward_item_rows(defaulter_order_ids, defaulter_reward_product_names)
+                    if defaulter_order_ids and defaulter_reward_product_names
+                    else pd.DataFrame()
+                )
+                defaulter_rows = build_tags_reward_defaulters(
+                    defaulter_item_rows,
+                    defaulter_reward_names,
+                    defaulter_month,
+                )
+            if defaulter_rows.empty:
+                st.info("No defaulter customers found for the selected month.")
+            else:
+                metric_cols = st.columns(4)
+                metric_cols[0].metric("Defaulter Customers", f"{defaulter_rows['Phone'].nunique():,}")
+                metric_cols[1].metric("Defaulter Rows", f"{len(defaulter_rows):,}")
+                metric_cols[2].metric("Extra Gift Qty", f"{defaulter_rows['Extra Qty'].sum():,.0f}")
+                metric_cols[3].metric("Redeemed Qty", f"{defaulter_rows['Redeemed Qty'].sum():,.0f}")
+                selected_defaulter_tag = st.selectbox(
+                    "Reward tag",
+                    ["All Tags"] + [tag_name for _, _, tag_name, _ in GIFT_MILESTONES],
+                    key=f"defaulter_reward_tag_{selected_tag_month.strftime('%Y_%m')}",
+                )
+                defaulter_view = defaulter_rows.copy()
+                if selected_defaulter_tag != "All Tags":
+                    defaulter_view = defaulter_view[defaulter_view["Milestone Tag"] == selected_defaulter_tag]
+                if defaulter_view.empty:
+                    st.info("No defaulter rows found for the selected reward tag.")
+                else:
+                    st.dataframe(defaulter_view, width="stretch", hide_index=True)
 
         with tags_below:
             st.subheader("Below 1000")
