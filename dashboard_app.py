@@ -2365,6 +2365,92 @@ def build_tags_reward_redemption(
     return pd.DataFrame(summary_rows), detail_frame
 
 
+def build_tags_reward_branch_summary(
+    month_orders: pd.DataFrame,
+    item_rows: pd.DataFrame,
+    reward_product_names: Dict[str, str],
+) -> pd.DataFrame:
+    if month_orders.empty:
+        return pd.DataFrame()
+
+    order_base = month_orders.copy()
+    order_base["phone"] = order_base["phone"].fillna("").astype(str).str.strip()
+    order_base["order_id"] = order_base["order_id"].fillna("").astype(str).str.strip()
+    order_base["branch_code"] = order_base["branch_code"].fillna("Unspecified").astype(str).str.strip()
+    order_base["amount"] = pd.to_numeric(order_base["amount"], errors="coerce").fillna(0.0)
+
+    branch_spend = (
+        order_base.groupby(["branch_code", "phone"], as_index=False)
+        .agg(Spend=("amount", "sum"))
+    )
+    branch_spend = branch_spend[(branch_spend["phone"] != "") & (branch_spend["phone"] != WALKIN_PLACEHOLDER)].copy()
+
+    item_frame = item_rows.copy()
+    if not item_frame.empty:
+        item_frame["sales_no"] = item_frame["sales_no"].fillna("").astype(str).str.strip()
+        item_frame["mob_no"] = item_frame["mob_no"].fillna("").astype(str).str.strip()
+        item_frame["product_name"] = item_frame["product_name"].fillna("").astype(str).str.strip()
+        item_frame["net_amount"] = pd.to_numeric(item_frame["net_amount"], errors="coerce").fillna(0.0)
+        item_frame["qty"] = pd.to_numeric(item_frame["qty"], errors="coerce").fillna(0.0)
+        item_frame["product_match_key"] = item_frame["product_name"].str.casefold()
+        order_branch = order_base[["order_id", "branch_code"]].drop_duplicates("order_id")
+        item_frame = item_frame.merge(order_branch, left_on="sales_no", right_on="order_id", how="left")
+        item_frame["branch_code"] = item_frame["branch_code"].fillna("Unspecified").astype(str).str.strip()
+
+    rows: List[Dict[str, object]] = []
+    branches = sorted(branch_spend["branch_code"].dropna().astype(str).unique().tolist())
+    if not item_frame.empty:
+        branches = sorted(set(branches) | set(item_frame["branch_code"].dropna().astype(str).unique().tolist()))
+
+    for branch in branches:
+        branch_customer_spend = branch_spend[branch_spend["branch_code"] == branch].copy()
+        for gift_label, gift_name, tag_name, milestone in GIFT_MILESTONES:
+            reward_product_name = str(reward_product_names.get(tag_name, "") or "").strip()
+            eligible = branch_customer_spend[branch_customer_spend["Spend"] >= milestone][["phone"]].drop_duplicates()
+            eligible_customers = int(eligible["phone"].nunique())
+
+            redeemed_customers = 0
+            redeemed_qty = 0.0
+            redeemed_value = 0.0
+            redeemed_orders = 0
+            if reward_product_name and eligible_customers and not item_frame.empty:
+                redeemed_items = item_frame[
+                    (item_frame["branch_code"] == branch)
+                    & item_frame["product_match_key"].eq(reward_product_name.casefold())
+                    & item_frame["mob_no"].isin(eligible["phone"])
+                ].copy()
+                if not redeemed_items.empty:
+                    redeemed_customers = int(redeemed_items["mob_no"].nunique())
+                    redeemed_qty = float(redeemed_items["qty"].sum())
+                    redeemed_value = float(redeemed_items["net_amount"].sum())
+                    redeemed_orders = int(redeemed_items["sales_no"].nunique())
+
+            pending_customers = max(eligible_customers - redeemed_customers, 0)
+            redemption_rate = 0.0 if eligible_customers == 0 else redeemed_customers / eligible_customers * 100
+            if eligible_customers or redeemed_customers:
+                rows.append(
+                    {
+                        "Branch": branch,
+                        "Gift": gift_label,
+                        "Gift Name": gift_name,
+                        "Milestone Tag": tag_name,
+                        "Milestone Spend": milestone,
+                        "Reward Product Name": reward_product_name or "Not mapped",
+                        "Eligible Customers": eligible_customers,
+                        "Redeemed Customers": redeemed_customers,
+                        "Pending Customers": pending_customers,
+                        "Redeemed Qty": round(redeemed_qty, 2),
+                        "Redeemed Value": round(redeemed_value, 2),
+                        "Redeemed Orders": redeemed_orders,
+                        "Redemption Rate %": round(redemption_rate, 2),
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["Branch", "Milestone Spend"])
+
+
 def build_tags_reward_defaulters(
     item_rows: pd.DataFrame,
     reward_product_names: Dict[str, str],
@@ -4580,6 +4666,11 @@ if selected_page == "Tags":
             tag_item_rows,
             reward_product_names,
         )
+        tag_redemption_branch_summary = build_tags_reward_branch_summary(
+            tag_month_orders,
+            tag_item_rows,
+            reward_product_names,
+        )
         tag_reward_defaulters = build_tags_reward_defaulters(
             tag_item_rows,
             reward_product_names,
@@ -4632,6 +4723,39 @@ if selected_page == "Tags":
                 st.info("No redemption rows found for the selected month.")
             else:
                 st.dataframe(tag_redemption_summary, width="stretch", hide_index=True)
+                st.markdown("**Branch Wise Eligible / Redemption**")
+                if tag_redemption_branch_summary.empty:
+                    st.info("No branch-wise redemption rows found for the selected month.")
+                else:
+                    branch_filter_cols = st.columns([1.0, 1.0, 1.0])
+                    branch_options = ["All Branches"] + sorted(
+                        tag_redemption_branch_summary["Branch"].dropna().astype(str).unique().tolist()
+                    )
+                    selected_redemption_branch = branch_filter_cols[0].selectbox(
+                        "Branch",
+                        branch_options,
+                        key=f"redemption_branch_{selected_tag_month.strftime('%Y_%m')}",
+                    )
+                    selected_branch_reward_tag = branch_filter_cols[1].selectbox(
+                        "Branch reward tag",
+                        ["All Tags"] + [tag_name for _, _, tag_name, _ in GIFT_MILESTONES],
+                        key=f"redemption_branch_reward_tag_{selected_tag_month.strftime('%Y_%m')}",
+                    )
+                    branch_view = tag_redemption_branch_summary.copy()
+                    if selected_redemption_branch != "All Branches":
+                        branch_view = branch_view[branch_view["Branch"] == selected_redemption_branch]
+                    if selected_branch_reward_tag != "All Tags":
+                        branch_view = branch_view[branch_view["Milestone Tag"] == selected_branch_reward_tag]
+                    branch_filter_cols[2].metric(
+                        "Eligible Customers",
+                        f"{int(branch_view['Eligible Customers'].sum()) if not branch_view.empty else 0:,}",
+                    )
+                    if branch_view.empty:
+                        st.info("No branch-wise rows found for the selected filters.")
+                    else:
+                        st.dataframe(branch_view, width="stretch", hide_index=True)
+
+                st.markdown("**Customer Redemption Detail**")
                 detail_filter_cols = st.columns([1.0, 1.0, 2.0])
                 selected_reward_tag = detail_filter_cols[0].selectbox(
                     "Reward tag",
