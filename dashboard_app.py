@@ -4746,14 +4746,27 @@ if selected_page == "Tags":
                         branch_view = branch_view[branch_view["Branch"] == selected_redemption_branch]
                     if selected_branch_reward_tag != "All Tags":
                         branch_view = branch_view[branch_view["Milestone Tag"] == selected_branch_reward_tag]
+                    branch_display = pd.DataFrame()
+                    if not branch_view.empty:
+                        branch_display = (
+                            branch_view.groupby(["Branch", "Gift Name"], as_index=False)
+                            .agg(
+                                **{
+                                    "Redeemed Qty": ("Redeemed Qty", "sum"),
+                                    "Eligible Customers": ("Pending Customers", "sum"),
+                                }
+                            )
+                            .rename(columns={"Branch": "Branch Code", "Gift Name": "Gift"})
+                            .sort_values(["Branch Code", "Gift"])
+                        )
                     branch_filter_cols[2].metric(
                         "Eligible Customers",
-                        f"{int(branch_view['Eligible Customers'].sum()) if not branch_view.empty else 0:,}",
+                        f"{int(branch_display['Eligible Customers'].sum()) if not branch_display.empty else 0:,}",
                     )
-                    if branch_view.empty:
+                    if branch_display.empty:
                         st.info("No branch-wise rows found for the selected filters.")
                     else:
-                        st.dataframe(branch_view, width="stretch", hide_index=True)
+                        st.dataframe(branch_display, width="stretch", hide_index=True)
 
                 st.markdown("**Customer Redemption Detail**")
                 detail_filter_cols = st.columns([1.0, 1.0, 2.0])
