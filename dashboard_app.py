@@ -387,7 +387,7 @@ def load_product_penetration_data(
         SUPABASE_HISTORY_TABLE,
         select_columns=(
             "sales_no,sales_date,branch_name,order_type,product_name,category_name,"
-            "qty,net_amount,mob_no"
+            "qty,net_amount,mob_no,customer_name"
         ),
         filters={"and": f"({','.join(filter_clauses)})"},
         order_column=None,
@@ -412,6 +412,9 @@ def load_product_penetration_data(
     frame["mob_no"] = frame["mob_no"].replace({"": WALKIN_PLACEHOLDER, "None": WALKIN_PLACEHOLDER})
     frame["branch_code"] = frame["cleaned_branch_code"].fillna(frame["branch_name"]).apply(normalize_branch)
     frame["order_type"] = frame["cleaned_order_type"].fillna(frame["order_type"]).apply(normalize_order_type)
+    if "customer_name" not in frame.columns:
+        frame["customer_name"] = ""
+    frame["customer_name"] = frame["customer_name"].fillna("").astype(str).str.strip()
     frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
     frame["category_name"] = frame["category_name"].fillna("").astype(str).str.strip()
     frame = frame[frame["product_name"] != ""].copy()
@@ -1491,6 +1494,37 @@ def compare_product_summary(current_frame: pd.DataFrame, previous_frame: pd.Data
         axis=1,
     )
     return merged.sort_values(["revenue_change", "qty_change"], ascending=[False, False])
+
+
+def build_selected_product_customer_detail(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+
+    detail_source = frame[frame["mob_no"] != WALKIN_PLACEHOLDER].copy()
+    if detail_source.empty:
+        return pd.DataFrame()
+    if "customer_name" not in detail_source.columns:
+        detail_source["customer_name"] = ""
+
+    detail = (
+        detail_source.groupby(["product_name", "mob_no", "customer_name"], as_index=False)
+        .agg(
+            Qty=("qty", "sum"),
+            Orders=("sales_no", "nunique"),
+            Revenue=("net_amount", "sum"),
+        )
+        .rename(
+            columns={
+                "product_name": "Product Name",
+                "mob_no": "Phone",
+                "customer_name": "Name",
+            }
+        )
+        .sort_values(["Qty", "Revenue", "Product Name"], ascending=[False, False, True])
+    )
+    detail["Qty"] = detail["Qty"].round(2)
+    detail["Revenue"] = detail["Revenue"].round(2)
+    return detail[["Product Name", "Phone", "Name", "Qty", "Orders", "Revenue"]]
 
 
 def compare_category_summary(current_frame: pd.DataFrame, previous_frame: pd.DataFrame) -> pd.DataFrame:
@@ -3500,6 +3534,18 @@ if selected_page == "Product Penetration":
             if product_comparison.empty:
                 st.info("No product rows found for the selected filters.")
             else:
+                if selected_products:
+                    selected_customer_detail = build_selected_product_customer_detail(product_current)
+                    st.markdown("**Selected Product Customers**")
+                    if selected_customer_detail.empty:
+                        st.info("No customer rows found for the selected products.")
+                    else:
+                        customer_cols = st.columns(3)
+                        customer_cols[0].metric("Users", f"{selected_customer_detail['Phone'].nunique():,}")
+                        customer_cols[1].metric("Qty", f"{selected_customer_detail['Qty'].sum():,.0f}")
+                        customer_cols[2].metric("Orders", f"{selected_customer_detail['Orders'].sum():,.0f}")
+                        st.dataframe(selected_customer_detail, width="stretch", hide_index=True)
+
                 summary_cols = st.columns(4)
                 for column, (label, value) in zip(summary_cols, product_change_summary.items()):
                     column.metric(label, f"{value:,}")
