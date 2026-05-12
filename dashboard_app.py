@@ -373,6 +373,7 @@ def load_product_penetration_data(
     query_end: str,
     branch_filter: str,
     type_filter: str,
+    include_customer_profile: bool = False,
 ) -> pd.DataFrame:
     filter_clauses = [
         f"sales_date.gte.{query_start}",
@@ -422,26 +423,29 @@ def load_product_penetration_data(
         type_value = "" if type_filter == "Unspecified" else type_filter
         frame = frame[frame["order_type"] == type_value.lower()].copy()
 
-    profile_phones = sorted(
-        {
-            phone
-            for phone in frame["mob_no"].dropna().astype(str).str.strip().tolist()
-            if phone and phone != WALKIN_PLACEHOLDER and phone.lower() != "none"
-        }
-    )
-    customer_profile = load_penetration_customer_profile(tuple(profile_phones))
-    if not customer_profile.empty:
-        frame = frame.merge(customer_profile, on="mob_no", how="left")
-        frame["is_new_customer"] = (
-            frame["mob_no"].ne(WALKIN_PLACEHOLDER)
-            & frame["first_order_day"].notna()
-            & frame["sales_day"].eq(frame["first_order_day"])
+    if include_customer_profile:
+        profile_phones = sorted(
+            {
+                phone
+                for phone in frame["mob_no"].dropna().astype(str).str.strip().tolist()
+                if phone and phone != WALKIN_PLACEHOLDER and phone.lower() != "none"
+            }
         )
-        frame["is_one_time_customer"] = (
-            frame["mob_no"].ne(WALKIN_PLACEHOLDER)
-            & frame["lifetime_order_count"].fillna(0).le(1)
-        )
-    else:
+        customer_profile = load_penetration_customer_profile(tuple(profile_phones))
+        if not customer_profile.empty:
+            frame = frame.merge(customer_profile, on="mob_no", how="left")
+            frame["is_new_customer"] = (
+                frame["mob_no"].ne(WALKIN_PLACEHOLDER)
+                & frame["first_order_day"].notna()
+                & frame["sales_day"].eq(frame["first_order_day"])
+            )
+            frame["is_one_time_customer"] = (
+                frame["mob_no"].ne(WALKIN_PLACEHOLDER)
+                & frame["lifetime_order_count"].fillna(0).le(1)
+            )
+            return frame
+
+    if "is_new_customer" not in frame.columns:
         frame["first_order_day"] = pd.NaT
         frame["lifetime_order_count"] = 0
         frame["is_new_customer"] = False
@@ -3412,20 +3416,43 @@ if selected_page == "Revenue vs Last Month":
 if selected_page == "Product Penetration":
     product_query_start = min(start_date, shift_date_one_month(start_date)).strftime("%Y-%m-%dT00:00:00")
     product_query_end = max(end_date, shift_date_one_month(end_date)).strftime("%Y-%m-%dT23:59:59")
+    current_start = start_date
+    current_end = end_date
+    previous_start = shift_date_one_month(current_start)
+    previous_end = shift_date_one_month(current_end)
+
+    st.subheader("Product Penetration")
+    st.caption(
+        "Current period: "
+        f"{current_start.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')} | "
+        "Last month comparison: "
+        f"{previous_start.strftime('%Y-%m-%d')} to {previous_end.strftime('%Y-%m-%d')}"
+    )
+    st.caption(
+        "This means if your filter is April 1 to April 15, it compares exactly against March 1 to March 15."
+    )
+    customer_filter_options = [
+        "All Customers",
+        "Exclude New Customers",
+        "Exclude One-Time Customers",
+    ]
+    selected_customer_filter = st.selectbox(
+        "Customer filter",
+        customer_filter_options,
+        index=0,
+        key="penetration_customer_filter",
+    )
+
     product_df = load_product_penetration_data(
         product_query_start,
         product_query_end,
         selected_branch,
         selected_type,
+        selected_customer_filter != "All Customers",
     )
     if product_df.empty:
         st.info("No joined product rows found.")
     else:
-        current_start = start_date
-        current_end = end_date
-        previous_start = shift_date_one_month(current_start)
-        previous_end = shift_date_one_month(current_end)
-
         product_filtered = product_df[
             (product_df["sales_day"].dt.date >= current_start)
             & (product_df["sales_day"].dt.date <= current_end)
@@ -3434,28 +3461,6 @@ if selected_page == "Product Penetration":
             (product_df["sales_day"].dt.date >= previous_start)
             & (product_df["sales_day"].dt.date <= previous_end)
         ].copy()
-
-        st.subheader("Product Penetration")
-        st.caption(
-            "Current period: "
-            f"{current_start.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')} | "
-            "Last month comparison: "
-            f"{previous_start.strftime('%Y-%m-%d')} to {previous_end.strftime('%Y-%m-%d')}"
-        )
-        st.caption(
-            "This means if your filter is April 1 to April 15, it compares exactly against March 1 to March 15."
-        )
-        customer_filter_options = [
-            "All Customers",
-            "Exclude New Customers",
-            "Exclude One-Time Customers",
-        ]
-        selected_customer_filter = st.selectbox(
-            "Customer filter",
-            customer_filter_options,
-            index=0,
-            key="penetration_customer_filter",
-        )
 
         if selected_customer_filter == "Exclude New Customers":
             product_filtered = product_filtered[~product_filtered["is_new_customer"]].copy()
@@ -3473,15 +3478,16 @@ if selected_page == "Product Penetration":
                 set(product_current["product_name"].dropna().astype(str).tolist())
                 | set(product_last_month["product_name"].dropna().astype(str).tolist())
             )
-            selected_product = st.selectbox(
+            selected_products = st.multiselect(
                 "Product Name",
-                product_options,
-                index=0,
-                key="product_penetration_filter",
+                product_options[1:],
+                default=[],
+                placeholder="All Products",
+                key="product_penetration_products_filter",
             )
-            if selected_product != "All Products":
-                product_current = product_current[product_current["product_name"] == selected_product]
-                product_last_month = product_last_month[product_last_month["product_name"] == selected_product]
+            if selected_products:
+                product_current = product_current[product_current["product_name"].isin(selected_products)]
+                product_last_month = product_last_month[product_last_month["product_name"].isin(selected_products)]
 
             product_comparison = compare_product_summary(product_current, product_last_month)
             product_cards = build_product_penetration_cards(product_comparison)
