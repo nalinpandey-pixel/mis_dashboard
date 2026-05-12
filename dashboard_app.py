@@ -367,7 +367,7 @@ def load_sales_data() -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(ttl=600, max_entries=3)
+@st.cache_data(ttl=600, max_entries=1)
 def load_product_penetration_data(
     query_start: str,
     query_end: str,
@@ -387,7 +387,7 @@ def load_product_penetration_data(
         SUPABASE_HISTORY_TABLE,
         select_columns=(
             "sales_no,sales_date,branch_name,order_type,product_name,category_name,"
-            "qty,net_amount,mob_no,customer_name"
+            "qty,net_amount,mob_no"
         ),
         filters={"and": f"({','.join(filter_clauses)})"},
         order_column=None,
@@ -412,9 +412,6 @@ def load_product_penetration_data(
     frame["mob_no"] = frame["mob_no"].replace({"": WALKIN_PLACEHOLDER, "None": WALKIN_PLACEHOLDER})
     frame["branch_code"] = frame["cleaned_branch_code"].fillna(frame["branch_name"]).apply(normalize_branch)
     frame["order_type"] = frame["cleaned_order_type"].fillna(frame["order_type"]).apply(normalize_order_type)
-    if "customer_name" not in frame.columns:
-        frame["customer_name"] = ""
-    frame["customer_name"] = frame["customer_name"].fillna("").astype(str).str.strip()
     frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
     frame["category_name"] = frame["category_name"].fillna("").astype(str).str.strip()
     frame = frame[frame["product_name"] != ""].copy()
@@ -453,6 +450,75 @@ def load_product_penetration_data(
         frame["lifetime_order_count"] = 0
         frame["is_new_customer"] = False
         frame["is_one_time_customer"] = False
+    return frame
+
+
+@st.cache_data(ttl=600, max_entries=2)
+def load_selected_product_customer_rows(
+    query_start: str,
+    query_end: str,
+    branch_filter: str,
+    type_filter: str,
+    product_names: Tuple[str, ...],
+) -> pd.DataFrame:
+    cleaned_product_names = tuple(
+        sorted(
+            {
+                str(product_name).strip()
+                for product_name in product_names
+                if str(product_name).strip() and str(product_name).strip().lower() not in {"none", "nan"}
+            }
+        )
+    )
+    if not cleaned_product_names:
+        return pd.DataFrame()
+
+    filter_clauses = [
+        f"sales_date.gte.{query_start}",
+        f"sales_date.lte.{query_end}",
+        "product_name.not.is.null",
+    ]
+    if type_filter in {"walkin", "delivery"}:
+        filter_clauses.append(f"order_type.eq.{supabase_quote_literal(type_filter)}")
+
+    frames: List[pd.DataFrame] = []
+    for start_idx in range(0, len(cleaned_product_names), 30):
+        batch = list(cleaned_product_names[start_idx : start_idx + 30])
+        batch_frame = load_supabase_table(
+            SUPABASE_HISTORY_TABLE,
+            select_columns=(
+                "sales_no,sales_date,branch_name,order_type,product_name,"
+                "qty,net_amount,mob_no,customer_name"
+            ),
+            filters={
+                "and": f"({','.join(filter_clauses)})",
+                "product_name": f"in.{build_supabase_in_filter(batch)}",
+            },
+            order_column=None,
+        )
+        if not batch_frame.empty:
+            frames.append(batch_frame)
+
+    if not frames:
+        return pd.DataFrame()
+
+    frame = pd.concat(frames, ignore_index=True)
+    frame["sales_date"] = frame["sales_date"].apply(safe_parse_sales_date)
+    frame["sales_day"] = frame["sales_date"].dt.normalize()
+    frame["sales_no"] = frame["sales_no"].fillna("").astype(str).str.strip()
+    frame["mob_no"] = frame["mob_no"].fillna("").astype(str).str.strip()
+    frame["mob_no"] = frame["mob_no"].replace({"": WALKIN_PLACEHOLDER, "None": WALKIN_PLACEHOLDER})
+    frame["branch_code"] = frame["branch_name"].apply(normalize_branch)
+    frame["order_type"] = frame["order_type"].apply(normalize_order_type)
+    frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
+    frame["customer_name"] = frame["customer_name"].fillna("").astype(str).str.strip()
+    frame["qty"] = pd.to_numeric(frame["qty"], errors="coerce").fillna(0.0)
+    frame["net_amount"] = pd.to_numeric(frame["net_amount"], errors="coerce").fillna(0.0)
+    if branch_filter != "All Branches":
+        frame = frame[frame["branch_code"] == branch_filter].copy()
+    if type_filter != "All Types":
+        type_value = "" if type_filter == "Unspecified" else type_filter
+        frame = frame[frame["order_type"] == type_value.lower()].copy()
     return frame
 
 
@@ -3535,7 +3601,21 @@ if selected_page == "Product Penetration":
                 st.info("No product rows found for the selected filters.")
             else:
                 if selected_products:
-                    selected_customer_detail = build_selected_product_customer_detail(product_current)
+                    selected_customer_rows = load_selected_product_customer_rows(
+                        current_start.strftime("%Y-%m-%dT00:00:00"),
+                        current_end.strftime("%Y-%m-%dT23:59:59"),
+                        selected_branch,
+                        selected_type,
+                        tuple(selected_products),
+                    )
+                    if selected_customer_filter != "All Customers" and not selected_customer_rows.empty:
+                        allowed_rows = product_current[["sales_no", "mob_no", "product_name"]].drop_duplicates()
+                        selected_customer_rows = selected_customer_rows.merge(
+                            allowed_rows,
+                            on=["sales_no", "mob_no", "product_name"],
+                            how="inner",
+                        )
+                    selected_customer_detail = build_selected_product_customer_detail(selected_customer_rows)
                     st.markdown("**Selected Product Customers**")
                     if selected_customer_detail.empty:
                         st.info("No customer rows found for the selected products.")
